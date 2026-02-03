@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio::sync::Mutex;
 
-use omnilink_core::config::Config;
+use omnilink_core::config::{Config, ChainConfig, ProxyServerConfig};
 use omnilink_core::dns::VirtualDns;
 use omnilink_core::proxy::chain::ChainRelay;
-use omnilink_core::rule::RuleEngine;
+use omnilink_core::rule::{Action, Condition, Rule, RuleEngine};
 use omnilink_core::session::SessionManager;
 use omnilink_core::stats::TrafficStats;
+use omnilink_core::sysproxy::SysProxyConfig;
 
 /// Shared application state managed by Tauri.
 pub struct AppStateInner {
@@ -25,6 +26,7 @@ pub struct AppStateInner {
     rule_engine: Option<Arc<RuleEngine>>,
     virtual_dns: Arc<VirtualDns>,
     chain_relay: Option<Arc<ChainRelay>>,
+    sysproxy_enabled: bool,
 }
 
 pub type SharedState = Mutex<AppStateInner>;
@@ -239,6 +241,307 @@ async fn reset_stats(state: State<'_, SharedState>) -> Result<String, String> {
     let state = state.lock().await;
     state.traffic_stats.reset();
     Ok("Statistics reset".to_string())
+}
+
+// --- Rules CRUD ---
+
+#[derive(Debug, Serialize)]
+pub struct RuleInfo {
+    pub index: usize,
+    pub name: String,
+    pub conditions: Vec<String>,
+    pub action: String,
+    pub priority: i32,
+    pub enabled: bool,
+}
+
+fn format_condition(cond: &Condition) -> String {
+    match cond {
+        Condition::ProcessName(p) => format!("process_name: {}", p),
+        Condition::ProcessPath(p) => format!("process_path: {}", p),
+        Condition::Domain(d) => format!("domain: {}", d),
+        Condition::Cidr(c) => format!("cidr: {}", c),
+        Condition::Port(p) => format!("port: {}", p),
+        Condition::PortRange(a, b) => format!("port_range: {}-{}", a, b),
+        Condition::User(u) => format!("user: {}", u),
+        Condition::Loopback => "loopback".to_string(),
+    }
+}
+
+fn format_action(action: &Action) -> String {
+    match action {
+        Action::Direct => "Direct".to_string(),
+        Action::Proxy(name) => format!("Proxy: {}", name),
+        Action::Block => "Block".to_string(),
+    }
+}
+
+#[tauri::command]
+async fn get_rules(state: State<'_, SharedState>) -> Result<Vec<RuleInfo>, String> {
+    let state = state.lock().await;
+    let config = match &state.config {
+        Some(c) => c,
+        None => return Ok(vec![]),
+    };
+    Ok(config
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(i, r)| RuleInfo {
+            index: i,
+            name: r.name.clone(),
+            conditions: r.conditions.iter().map(format_condition).collect(),
+            action: format_action(&r.action),
+            priority: r.priority,
+            enabled: r.enabled,
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddRuleRequest {
+    pub name: String,
+    pub conditions: Vec<ConditionInput>,
+    pub action: String,
+    pub proxy_name: Option<String>,
+    pub priority: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", content = "value")]
+pub enum ConditionInput {
+    #[serde(rename = "process_name")]
+    ProcessName(String),
+    #[serde(rename = "domain")]
+    Domain(String),
+    #[serde(rename = "cidr")]
+    Cidr(String),
+    #[serde(rename = "port")]
+    Port(u16),
+    #[serde(rename = "port_range")]
+    PortRange([u16; 2]),
+}
+
+fn parse_condition(input: &ConditionInput) -> Condition {
+    match input {
+        ConditionInput::ProcessName(v) => Condition::ProcessName(v.clone()),
+        ConditionInput::Domain(v) => Condition::Domain(v.clone()),
+        ConditionInput::Cidr(v) => Condition::Cidr(v.clone()),
+        ConditionInput::Port(v) => Condition::Port(*v),
+        ConditionInput::PortRange(v) => Condition::PortRange(v[0], v[1]),
+    }
+}
+
+fn parse_action(action: &str, proxy_name: Option<&str>) -> Action {
+    match action {
+        "block" => Action::Block,
+        "proxy" => Action::Proxy(proxy_name.unwrap_or("default").to_string()),
+        _ => Action::Direct,
+    }
+}
+
+#[tauri::command]
+async fn add_rule(state: State<'_, SharedState>, req: AddRuleRequest) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+    let rule = Rule {
+        name: req.name,
+        conditions: req.conditions.iter().map(parse_condition).collect(),
+        action: parse_action(&req.action, req.proxy_name.as_deref()),
+        priority: req.priority,
+        enabled: true,
+        dns_mode: None,
+    };
+    config.rules.push(rule);
+    Ok("Rule added".to_string())
+}
+
+#[tauri::command]
+async fn toggle_rule(state: State<'_, SharedState>, index: usize) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+    let rule = config.rules.get_mut(index).ok_or("Rule not found")?;
+    rule.enabled = !rule.enabled;
+    Ok(format!("Rule '{}' {}", rule.name, if rule.enabled { "enabled" } else { "disabled" }))
+}
+
+#[tauri::command]
+async fn delete_rule(state: State<'_, SharedState>, index: usize) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+    if index >= config.rules.len() {
+        return Err("Rule not found".to_string());
+    }
+    let removed = config.rules.remove(index);
+    Ok(format!("Rule '{}' deleted", removed.name))
+}
+
+// --- Proxy CRUD ---
+
+#[derive(Debug, Deserialize)]
+pub struct AddProxyRequest {
+    pub name: String,
+    pub protocol: String,
+    pub address: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[tauri::command]
+async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+
+    let protocol = match req.protocol.to_lowercase().as_str() {
+        "socks4" => omnilink_core::proxy::ProxyProtocol::Socks4,
+        "socks4a" => omnilink_core::proxy::ProxyProtocol::Socks4a,
+        "socks5" => omnilink_core::proxy::ProxyProtocol::Socks5,
+        "http" => omnilink_core::proxy::ProxyProtocol::Http,
+        "https" => omnilink_core::proxy::ProxyProtocol::Https,
+        _ => return Err(format!("Unknown protocol: {}", req.protocol)),
+    };
+
+    let auth = match (req.username, req.password) {
+        (Some(u), Some(p)) if !u.is_empty() => {
+            Some(omnilink_core::proxy::ProxyAuth {
+                username: u,
+                password: p,
+            })
+        }
+        _ => None,
+    };
+
+    config.proxies.push(ProxyServerConfig {
+        name: req.name.clone(),
+        protocol,
+        address: req.address,
+        port: req.port,
+        auth,
+    });
+
+    Ok(format!("Proxy '{}' added", req.name))
+}
+
+#[tauri::command]
+async fn delete_proxy(state: State<'_, SharedState>, name: String) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+    let before = config.proxies.len();
+    config.proxies.retain(|p| p.name != name);
+    if config.proxies.len() == before {
+        return Err(format!("Proxy '{}' not found", name));
+    }
+    Ok(format!("Proxy '{}' deleted", name))
+}
+
+// --- Chains ---
+
+#[derive(Debug, Serialize)]
+pub struct ChainInfo {
+    pub name: String,
+    pub proxies: Vec<String>,
+    pub mode: String,
+}
+
+#[tauri::command]
+async fn get_chains(state: State<'_, SharedState>) -> Result<Vec<ChainInfo>, String> {
+    let state = state.lock().await;
+    let config = match &state.config {
+        Some(c) => c,
+        None => return Ok(vec![]),
+    };
+    Ok(config
+        .chains
+        .iter()
+        .map(|c| ChainInfo {
+            name: c.name.clone(),
+            proxies: c.proxies.clone(),
+            mode: format!("{:?}", c.mode),
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddChainRequest {
+    pub name: String,
+    pub proxies: Vec<String>,
+    pub mode: String,
+}
+
+#[tauri::command]
+async fn add_chain(state: State<'_, SharedState>, req: AddChainRequest) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+
+    let mode = match req.mode.to_lowercase().as_str() {
+        "failover" => omnilink_core::config::ChainMode::Failover,
+        "round_robin" | "roundrobin" => omnilink_core::config::ChainMode::RoundRobin,
+        "random" => omnilink_core::config::ChainMode::Random,
+        _ => omnilink_core::config::ChainMode::Strict,
+    };
+
+    config.chains.push(ChainConfig {
+        name: req.name.clone(),
+        proxies: req.proxies,
+        mode,
+    });
+
+    Ok(format!("Chain '{}' added", req.name))
+}
+
+#[tauri::command]
+async fn delete_chain(state: State<'_, SharedState>, name: String) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_mut().ok_or("No configuration loaded")?;
+    let before = config.chains.len();
+    config.chains.retain(|c| c.name != name);
+    if config.chains.len() == before {
+        return Err(format!("Chain '{}' not found", name));
+    }
+    Ok(format!("Chain '{}' deleted", name))
+}
+
+// --- System proxy ---
+
+#[tauri::command]
+async fn toggle_sysproxy(state: State<'_, SharedState>) -> Result<String, String> {
+    let mut state = state.lock().await;
+    let config = state.config.as_ref().ok_or("No configuration loaded")?;
+    let listen = &config.general.listen_addr;
+
+    let parts: Vec<&str> = listen.split(':').collect();
+    let host = parts.first().copied().unwrap_or("127.0.0.1");
+    let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1080);
+
+    let sysproxy = SysProxyConfig::new(host, port);
+
+    if state.sysproxy_enabled {
+        sysproxy.disable().map_err(|e| e.to_string())?;
+        state.sysproxy_enabled = false;
+        Ok("System proxy disabled".to_string())
+    } else {
+        sysproxy.enable().map_err(|e| e.to_string())?;
+        state.sysproxy_enabled = true;
+        Ok("System proxy enabled".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_sysproxy_status(state: State<'_, SharedState>) -> Result<bool, String> {
+    let state = state.lock().await;
+    Ok(state.sysproxy_enabled)
+}
+
+// --- Save config ---
+
+#[tauri::command]
+async fn save_config(state: State<'_, SharedState>) -> Result<String, String> {
+    let state = state.lock().await;
+    let config = state.config.as_ref().ok_or("No configuration loaded")?;
+    let yaml = serde_yaml::to_string(config).map_err(|e| e.to_string())?;
+    std::fs::write(&state.config_path, yaml).map_err(|e| e.to_string())?;
+    Ok(format!("Configuration saved to {}", state.config_path.display()))
 }
 
 async fn run_service(
@@ -493,6 +796,7 @@ pub fn run() {
         rule_engine: None,
         virtual_dns: Arc::new(VirtualDns::new()),
         chain_relay: None,
+        sysproxy_enabled: false,
     };
 
     tauri::Builder::default()
@@ -506,6 +810,18 @@ pub fn run() {
             stop_service,
             get_traffic_stats,
             reset_stats,
+            get_rules,
+            add_rule,
+            toggle_rule,
+            delete_rule,
+            add_proxy,
+            delete_proxy,
+            get_chains,
+            add_chain,
+            delete_chain,
+            toggle_sysproxy,
+            get_sysproxy_status,
+            save_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
