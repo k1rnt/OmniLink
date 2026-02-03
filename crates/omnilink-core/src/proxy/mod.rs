@@ -1,5 +1,6 @@
-pub mod socks5;
+pub mod chain;
 pub mod http;
+pub mod socks5;
 
 use std::net::SocketAddr;
 use thiserror::Error;

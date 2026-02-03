@@ -77,13 +77,18 @@ async fn cmd_run(config_path: &PathBuf) -> Result<()> {
     // Build virtual DNS
     let virtual_dns = std::sync::Arc::new(omnilink_core::dns::VirtualDns::new());
 
-    // Build proxy server map
+    // Build proxy server map and chain relay
     let mut proxy_map = std::collections::HashMap::new();
     for proxy_cfg in &config.proxies {
         let server = proxy_cfg.to_proxy_server()?;
         proxy_map.insert(proxy_cfg.name.clone(), server);
     }
-    let proxy_map = std::sync::Arc::new(proxy_map);
+
+    let chain_relay = omnilink_core::proxy::chain::ChainRelay::new(
+        config.chains.clone(),
+        proxy_map,
+    );
+    let chain_relay = std::sync::Arc::new(chain_relay);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -91,11 +96,11 @@ async fn cmd_run(config_path: &PathBuf) -> Result<()> {
 
         let rule_engine = rule_engine.clone();
         let virtual_dns = virtual_dns.clone();
-        let proxy_map = proxy_map.clone();
+        let chain_relay = chain_relay.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(stream, &rule_engine, &virtual_dns, &proxy_map).await
+                handle_connection(stream, &rule_engine, &virtual_dns, &chain_relay).await
             {
                 tracing::error!(peer = %peer_addr, error = %e, "connection handler error");
             }
@@ -107,7 +112,7 @@ async fn handle_connection(
     mut inbound: tokio::net::TcpStream,
     rule_engine: &omnilink_core::rule::RuleEngine,
     virtual_dns: &omnilink_core::dns::VirtualDns,
-    proxy_map: &std::collections::HashMap<String, omnilink_core::proxy::ProxyServer>,
+    chain_relay: &omnilink_core::proxy::chain::ChainRelay,
 ) -> Result<()> {
     use omnilink_core::proxy::ProxyDestination;
     use omnilink_core::rule::{Action, MatchContext};
@@ -249,19 +254,7 @@ async fn handle_connection(
             }
         }
         Action::Proxy(proxy_name) => {
-            let server = proxy_map
-                .get(&proxy_name)
-                .ok_or_else(|| anyhow::anyhow!("proxy '{}' not found", proxy_name))?;
-
-            let outbound_result = match server.protocol {
-                omnilink_core::proxy::ProxyProtocol::Socks5 => {
-                    omnilink_core::proxy::socks5::connect(server, &dest).await
-                }
-                omnilink_core::proxy::ProxyProtocol::Http
-                | omnilink_core::proxy::ProxyProtocol::Https => {
-                    omnilink_core::proxy::http::connect(server, &dest).await
-                }
-            };
+            let outbound_result = chain_relay.connect(&proxy_name, &dest).await;
 
             match outbound_result {
                 Ok(mut outbound) => {

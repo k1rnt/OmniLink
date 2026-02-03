@@ -78,7 +78,7 @@ fn parse_status_code(status_line: &str) -> Result<u16, ProxyError> {
         .map_err(|_| ProxyError::ProtocolError("invalid status code".to_string()))
 }
 
-fn base64_encode(input: &str) -> String {
+pub fn base64_encode(input: &str) -> String {
     use base64_chars::*;
     let bytes = input.as_bytes();
     let mut result = String::new();
