@@ -2,6 +2,12 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AppState } from "../types";
 
+interface ProfileInfo {
+  name: string;
+  path: string;
+  active: boolean;
+}
+
 interface Props {
   state: AppState;
 }
@@ -10,6 +16,17 @@ function SettingsView({ state }: Props) {
   const [sysproxyEnabled, setSysproxyEnabled] = useState(false);
   const [configPath, setConfigPath] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  const [newProfileName, setNewProfileName] = useState("");
+
+  const fetchProfiles = useCallback(async () => {
+    try {
+      const data = await invoke<ProfileInfo[]>("get_profiles");
+      setProfiles(data);
+    } catch (e) {
+      console.error("Failed to fetch profiles:", e);
+    }
+  }, []);
 
   const fetchSysproxy = useCallback(async () => {
     try {
@@ -22,7 +39,8 @@ function SettingsView({ state }: Props) {
 
   useEffect(() => {
     fetchSysproxy();
-  }, [fetchSysproxy]);
+    fetchProfiles();
+  }, [fetchSysproxy, fetchProfiles]);
 
   const showMessage = (msg: string) => {
     setMessage(msg);
@@ -128,6 +146,66 @@ function SettingsView({ state }: Props) {
               onClick={handleToggleSysproxy}
             >
               {sysproxyEnabled ? "Disable" : "Enable"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="setting-group">
+        <h3>Profiles</h3>
+        {profiles.map((profile) => (
+          <div className="setting-row" key={profile.name}>
+            <span className="setting-label">
+              {profile.name}
+              {profile.active && (
+                <span style={{ fontSize: 10, color: "var(--accent)", marginLeft: 6 }}>active</span>
+              )}
+            </span>
+            {!profile.active && (
+              <button
+                className="btn btn-primary"
+                style={{ padding: "3px 10px", fontSize: 11 }}
+                onClick={async () => {
+                  try {
+                    const result = await invoke<string>("switch_profile", { path: profile.path });
+                    showMessage(result);
+                    await fetchProfiles();
+                  } catch (e) {
+                    showMessage(`Error: ${e}`);
+                  }
+                }}
+              >
+                Switch
+              </button>
+            )}
+          </div>
+        ))}
+        <div className="setting-row">
+          <span className="setting-label">Save as Profile</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input
+              className="search-input"
+              placeholder="profile name"
+              value={newProfileName}
+              onChange={(e) => setNewProfileName(e.target.value)}
+              style={{ width: 150 }}
+            />
+            <button
+              className="btn"
+              style={{ padding: "3px 10px", fontSize: 11 }}
+              onClick={async () => {
+                if (!newProfileName) return;
+                try {
+                  const result = await invoke<string>("save_profile", { name: newProfileName });
+                  showMessage(result);
+                  setNewProfileName("");
+                  await fetchProfiles();
+                } catch (e) {
+                  showMessage(`Error: ${e}`);
+                }
+              }}
+            >
+              Save
             </button>
           </div>
         </div>

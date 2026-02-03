@@ -552,6 +552,94 @@ async fn terminate_session(state: State<'_, SharedState>, session_id: u64) -> Re
     }
 }
 
+// --- Profiles ---
+
+#[derive(Debug, Serialize)]
+pub struct ProfileInfo {
+    pub name: String,
+    pub path: String,
+    pub active: bool,
+}
+
+#[tauri::command]
+async fn get_profiles(state: State<'_, SharedState>) -> Result<Vec<ProfileInfo>, String> {
+    let state = state.lock().await;
+    let profiles_dir = state.config_path.parent().unwrap_or(std::path::Path::new(".")).join("profiles");
+    let mut profiles = Vec::new();
+
+    // Always include the current config as "default" profile
+    let current_name = state.config_path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default")
+        .to_string();
+
+    profiles.push(ProfileInfo {
+        name: current_name.clone(),
+        path: state.config_path.display().to_string(),
+        active: true,
+    });
+
+    // Scan profiles directory for .yaml files
+    if profiles_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                    let name = path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if name != current_name {
+                        profiles.push(ProfileInfo {
+                            name,
+                            path: path.display().to_string(),
+                            active: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(profiles)
+}
+
+#[tauri::command]
+async fn switch_profile(state: State<'_, SharedState>, path: String) -> Result<String, String> {
+    let mut state = state.lock().await;
+
+    if state.running {
+        return Err("Stop the service before switching profiles".to_string());
+    }
+
+    let config_path = PathBuf::from(&path);
+    let config = Config::load(&config_path).map_err(|e| format!("Failed to load profile: {}", e))?;
+    let profile_name = config_path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    state.config = Some(config);
+    state.config_path = config_path;
+
+    Ok(format!("Switched to profile '{}'", profile_name))
+}
+
+#[tauri::command]
+async fn save_profile(state: State<'_, SharedState>, name: String) -> Result<String, String> {
+    let state = state.lock().await;
+    let config = state.config.as_ref().ok_or("No configuration loaded")?;
+
+    let profiles_dir = state.config_path.parent().unwrap_or(std::path::Path::new(".")).join("profiles");
+    std::fs::create_dir_all(&profiles_dir).map_err(|e| e.to_string())?;
+
+    let profile_path = profiles_dir.join(format!("{}.yaml", name));
+    let yaml = serde_yaml::to_string(config).map_err(|e| e.to_string())?;
+    std::fs::write(&profile_path, yaml).map_err(|e| e.to_string())?;
+
+    Ok(format!("Profile '{}' saved to {}", name, profile_path.display()))
+}
+
 // --- Save config ---
 
 #[tauri::command]
@@ -873,6 +961,9 @@ pub fn run() {
             toggle_sysproxy,
             get_sysproxy_status,
             terminate_session,
+            get_profiles,
+            switch_profile,
+            save_profile,
             save_config,
         ])
         .run(tauri::generate_context!())
