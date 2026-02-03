@@ -198,6 +198,8 @@ pub async fn connect_single(
     dest: &ProxyDestination,
 ) -> Result<TcpStream, ProxyError> {
     match server.protocol {
+        ProxyProtocol::Socks4 => super::socks4::connect(server, dest).await,
+        ProxyProtocol::Socks4a => super::socks4::connect_4a(server, dest).await,
         ProxyProtocol::Socks5 => super::socks5::connect(server, dest).await,
         ProxyProtocol::Http | ProxyProtocol::Https => super::http::connect(server, dest).await,
     }
@@ -213,6 +215,14 @@ async fn tunnel_through(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     match server.protocol {
+        ProxyProtocol::Socks4 | ProxyProtocol::Socks4a => {
+            // SOCKS4/4a cannot be used as intermediate tunnel proxies
+            // because they don't support tunneling over existing connections.
+            // Fall back to a fresh connection for these protocols.
+            return Err(ProxyError::ProtocolError(
+                "SOCKS4/4a cannot be used as intermediate proxy in strict chains".to_string(),
+            ));
+        }
         ProxyProtocol::Socks5 => {
             // SOCKS5 handshake on existing stream
             let methods: Vec<u8> = if server.auth.is_some() {

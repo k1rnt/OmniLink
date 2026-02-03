@@ -1,5 +1,6 @@
 pub mod chain;
 pub mod http;
+pub mod socks4;
 pub mod socks5;
 
 use std::net::SocketAddr;
@@ -23,6 +24,8 @@ pub enum ProxyError {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ProxyProtocol {
+    Socks4,
+    Socks4a,
     Socks5,
     Http,
     Https,
