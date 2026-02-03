@@ -20,3 +20,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
 tokio-util = "0.7"
 omnilink-core = { path = "../../crates/omnilink-core" }
+omnilink-tun = { path = "../../crates/omnilink-tun" }

@@ -29,6 +29,9 @@ pub struct AppStateInner {
     sysproxy_enabled: bool,
     /// Abort handles for individual connections, keyed by session ID.
     connection_handles: Arc<tokio::sync::Mutex<HashMap<u64, tokio_util::sync::CancellationToken>>>,
+    /// Handle to the running interceptor task.
+    interceptor_handle: Option<tokio::task::JoinHandle<()>>,
+    interceptor_running: bool,
 }
 
 pub type SharedState = Mutex<AppStateInner>;
@@ -660,6 +663,149 @@ async fn save_config(state: State<'_, SharedState>) -> Result<String, String> {
     Ok(format!("Configuration saved to {}", state.config_path.display()))
 }
 
+// --- Interceptor ---
+
+#[tauri::command]
+async fn start_interceptor(state: State<'_, SharedState>) -> Result<String, String> {
+    let mut state_guard = state.lock().await;
+
+    if state_guard.interceptor_running {
+        return Err("Interceptor is already running".to_string());
+    }
+
+    let config = state_guard
+        .config
+        .clone()
+        .ok_or("No configuration loaded")?;
+
+    // Build rule engine
+    let rule_engine = Arc::new(RuleEngine::with_default_action(
+        config.rules.clone(),
+        config.default_action.clone(),
+    ));
+
+    // Build proxy map and chain relay
+    let mut proxy_map = HashMap::new();
+    for proxy_cfg in &config.proxies {
+        let server = proxy_cfg.to_proxy_server().map_err(|e| e.to_string())?;
+        proxy_map.insert(proxy_cfg.name.clone(), server);
+    }
+    let chain_relay = Arc::new(ChainRelay::new(config.chains.clone(), proxy_map));
+
+    // Collect excluded IPs
+    let mut excluded_ips = Vec::new();
+    for proxy_cfg in &config.proxies {
+        if let Ok(ip) = proxy_cfg.address.parse::<std::net::Ipv4Addr>() {
+            excluded_ips.push(ip);
+        }
+    }
+
+    let virtual_dns = state_guard.virtual_dns.clone();
+    let mut interceptor = omnilink_tun::create_interceptor(virtual_dns.clone(), excluded_ips);
+
+    let mut event_rx = interceptor
+        .start()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let handle = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                omnilink_tun::interceptor::InterceptorEvent::NewConnection(conn, mut inbound) => {
+                    let rule_engine = rule_engine.clone();
+                    let virtual_dns = virtual_dns.clone();
+                    let chain_relay = chain_relay.clone();
+
+                    tokio::spawn(async move {
+                        use omnilink_core::proxy::ProxyDestination;
+                        use omnilink_core::rule::MatchContext;
+
+                        let dst_ip = conn.original_dst.ip();
+                        let dst_port = conn.original_dst.port();
+                        let domain = virtual_dns.lookup(dst_ip);
+
+                        let dest = if let Some(ref d) = domain {
+                            ProxyDestination::Domain(d.clone(), dst_port)
+                        } else {
+                            ProxyDestination::SocketAddr(conn.original_dst)
+                        };
+
+                        let ctx = MatchContext {
+                            process_name: None,
+                            process_path: None,
+                            process_user: None,
+                            dest_domain: domain,
+                            dest_ip: Some(dst_ip),
+                            dest_port: dst_port,
+                        };
+
+                        let action = rule_engine.evaluate(&ctx);
+
+                        match action {
+                            Action::Block => {}
+                            Action::Direct => {
+                                let target = match &dest {
+                                    ProxyDestination::SocketAddr(a) => a.to_string(),
+                                    ProxyDestination::Domain(d, p) => format!("{}:{}", d, p),
+                                };
+                                if let Ok(mut outbound) =
+                                    tokio::net::TcpStream::connect(&target).await
+                                {
+                                    let (mut ri, mut wi) = inbound.split();
+                                    let (mut ro, mut wo) = outbound.split();
+                                    let _ = tokio::try_join!(
+                                        tokio::io::copy(&mut ri, &mut wo),
+                                        tokio::io::copy(&mut ro, &mut wi),
+                                    );
+                                }
+                            }
+                            Action::Proxy(ref pname) => {
+                                if let Ok(mut outbound) =
+                                    chain_relay.connect(pname, &dest).await
+                                {
+                                    let (mut ri, mut wi) = inbound.split();
+                                    let (mut ro, mut wo) = outbound.split();
+                                    let _ = tokio::try_join!(
+                                        tokio::io::copy(&mut ri, &mut wo),
+                                        tokio::io::copy(&mut ro, &mut wi),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    state_guard.interceptor_handle = Some(handle);
+    state_guard.interceptor_running = true;
+
+    Ok("Interceptor started".to_string())
+}
+
+#[tauri::command]
+async fn stop_interceptor(state: State<'_, SharedState>) -> Result<String, String> {
+    let mut state_guard = state.lock().await;
+
+    if !state_guard.interceptor_running {
+        return Err("Interceptor is not running".to_string());
+    }
+
+    if let Some(handle) = state_guard.interceptor_handle.take() {
+        handle.abort();
+    }
+
+    state_guard.interceptor_running = false;
+    Ok("Interceptor stopped".to_string())
+}
+
+#[tauri::command]
+async fn get_interceptor_status(state: State<'_, SharedState>) -> Result<bool, String> {
+    let state = state.lock().await;
+    Ok(state.interceptor_running)
+}
+
 async fn run_service(
     listen_addr: &str,
     rule_engine: Arc<RuleEngine>,
@@ -945,6 +1091,8 @@ pub fn run() {
         chain_relay: None,
         sysproxy_enabled: false,
         connection_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        interceptor_handle: None,
+        interceptor_running: false,
     };
 
     tauri::Builder::default()
@@ -974,6 +1122,9 @@ pub fn run() {
             switch_profile,
             save_profile,
             save_config,
+            start_interceptor,
+            stop_interceptor,
+            get_interceptor_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,6 +8,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use omnilink_core::config::Config;
+use omnilink_tun::interceptor::InterceptorEvent;
 
 #[derive(Parser)]
 #[command(name = "omnilink")]
@@ -40,6 +41,8 @@ enum Commands {
         #[arg(short, long, default_value = "5")]
         timeout: u64,
     },
+    /// Start transparent traffic interception (requires root/admin)
+    Intercept,
 }
 
 #[tokio::main]
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
         Commands::CheckProxies { timeout } => {
             cmd_check_proxies(&cli.config, timeout).await
         }
+        Commands::Intercept => cmd_intercept(&cli.config).await,
     }
 }
 
@@ -331,6 +335,176 @@ fn cmd_init(config_path: &PathBuf) -> Result<()> {
     let yaml = serde_yaml::to_string(&config)?;
     std::fs::write(config_path, yaml)?;
     println!("Default config written to {}", config_path.display());
+    Ok(())
+}
+
+async fn cmd_intercept(config_path: &PathBuf) -> Result<()> {
+    let config = Config::load(config_path)?;
+
+    tracing::info!(
+        proxies = config.proxies.len(),
+        rules = config.rules.len(),
+        "starting OmniLink interceptor"
+    );
+
+    // Build rule engine
+    let rule_engine = omnilink_core::rule::RuleEngine::with_default_action(
+        config.rules.clone(),
+        config.default_action.clone(),
+    );
+    let rule_engine = std::sync::Arc::new(rule_engine);
+
+    // Build virtual DNS
+    let virtual_dns = std::sync::Arc::new(omnilink_core::dns::VirtualDns::new());
+
+    // Build proxy map and chain relay
+    let mut proxy_map = std::collections::HashMap::new();
+    for proxy_cfg in &config.proxies {
+        let server = proxy_cfg.to_proxy_server()?;
+        proxy_map.insert(proxy_cfg.name.clone(), server);
+    }
+
+    let chain_relay = omnilink_core::proxy::chain::ChainRelay::new(
+        config.chains.clone(),
+        proxy_map,
+    );
+    let chain_relay = std::sync::Arc::new(chain_relay);
+
+    // Collect proxy server IPs to exclude from interception
+    let mut excluded_ips = Vec::new();
+    for proxy_cfg in &config.proxies {
+        if let Ok(ip) = proxy_cfg.address.parse::<std::net::Ipv4Addr>() {
+            excluded_ips.push(ip);
+        } else if let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", proxy_cfg.address)).await
+        {
+            for addr in addrs {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    excluded_ips.push(v4);
+                }
+            }
+        }
+    }
+
+    tracing::info!(excluded = ?excluded_ips, "proxy server IPs excluded from interception");
+
+    // Create platform-specific interceptor
+    let mut interceptor = omnilink_tun::create_interceptor(virtual_dns.clone(), excluded_ips);
+
+    let mut event_rx = interceptor.start().await.map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!("interceptor started, press Ctrl+C to stop");
+
+    // Handle Ctrl+C for clean shutdown
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                match event {
+                    InterceptorEvent::NewConnection(conn, inbound) => {
+                        let rule_engine = rule_engine.clone();
+                        let virtual_dns = virtual_dns.clone();
+                        let chain_relay = chain_relay.clone();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_intercepted_connection(
+                                conn,
+                                inbound,
+                                &rule_engine,
+                                &virtual_dns,
+                                &chain_relay,
+                            ).await {
+                                tracing::error!(error = %e, "intercepted connection handler error");
+                            }
+                        });
+                    }
+                }
+            }
+            _ = &mut shutdown => {
+                tracing::info!("shutting down interceptor...");
+                interceptor.stop().await.map_err(|e| anyhow::anyhow!(e))?;
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_intercepted_connection(
+    conn: omnilink_tun::interceptor::InterceptedConnection,
+    mut inbound: tokio::net::TcpStream,
+    rule_engine: &omnilink_core::rule::RuleEngine,
+    virtual_dns: &omnilink_core::dns::VirtualDns,
+    chain_relay: &omnilink_core::proxy::chain::ChainRelay,
+) -> Result<()> {
+    use omnilink_core::proxy::ProxyDestination;
+    use omnilink_core::rule::{Action, MatchContext};
+
+    let dst_ip = conn.original_dst.ip();
+    let dst_port = conn.original_dst.port();
+
+    // Look up domain from VirtualDns if it's a fake IP
+    let domain = virtual_dns.lookup(dst_ip);
+    let dest = if let Some(ref d) = domain {
+        ProxyDestination::Domain(d.clone(), dst_port)
+    } else {
+        ProxyDestination::SocketAddr(conn.original_dst)
+    };
+
+    let ctx = MatchContext {
+        process_name: None,
+        process_path: None,
+        process_user: None,
+        dest_domain: domain.clone(),
+        dest_ip: Some(dst_ip),
+        dest_port: dst_port,
+    };
+
+    let action = rule_engine.evaluate(&ctx);
+    tracing::info!(dest = %dest, action = ?action, "intercepted connection routing");
+
+    match action {
+        Action::Block => {
+            tracing::info!(dest = %dest, "connection blocked by rule");
+        }
+        Action::Direct => {
+            let target_addr = match &dest {
+                ProxyDestination::SocketAddr(a) => a.to_string(),
+                ProxyDestination::Domain(d, p) => format!("{}:{}", d, p),
+            };
+
+            match tokio::net::TcpStream::connect(&target_addr).await {
+                Ok(mut outbound) => {
+                    let (mut ri, mut wi) = inbound.split();
+                    let (mut ro, mut wo) = outbound.split();
+                    let _ = tokio::try_join!(
+                        tokio::io::copy(&mut ri, &mut wo),
+                        tokio::io::copy(&mut ro, &mut wi),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(dest = %dest, error = %e, "direct connection failed");
+                }
+            }
+        }
+        Action::Proxy(proxy_name) => {
+            match chain_relay.connect(&proxy_name, &dest).await {
+                Ok(mut outbound) => {
+                    let (mut ri, mut wi) = inbound.split();
+                    let (mut ro, mut wo) = outbound.split();
+                    let _ = tokio::try_join!(
+                        tokio::io::copy(&mut ri, &mut wo),
+                        tokio::io::copy(&mut ro, &mut wi),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(dest = %dest, proxy = %proxy_name, error = %e, "proxy connection failed");
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

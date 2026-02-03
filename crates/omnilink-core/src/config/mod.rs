@@ -162,6 +162,38 @@ impl Config {
     }
 }
 
+/// Configuration for the OS-level traffic interceptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterceptorConfig {
+    /// Enable the interceptor.
+    #[serde(default)]
+    pub enabled: bool,
+    /// TUN device address (default: 10.0.0.1).
+    #[serde(default = "default_tun_addr")]
+    pub tun_addr: String,
+    /// MTU for the TUN device.
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+}
+
+impl Default for InterceptorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tun_addr: default_tun_addr(),
+            mtu: default_mtu(),
+        }
+    }
+}
+
+fn default_tun_addr() -> String {
+    "10.0.0.1".to_string()
+}
+
+fn default_mtu() -> u16 {
+    1500
+}
+
 /// Configuration profile: a named, switchable set of settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {

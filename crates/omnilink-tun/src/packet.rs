@@ -150,6 +150,122 @@ pub fn parse_transport(data: &[u8], ip_info: &IpPacketInfo) -> Result<TransportI
     }
 }
 
+// --- Packet rewrite utilities ---
+
+/// Rewrite the destination IPv4 address in a packet.
+pub fn rewrite_ipv4_dst(packet: &mut [u8], new_dst: std::net::Ipv4Addr) {
+    let octets = new_dst.octets();
+    packet[16..20].copy_from_slice(&octets);
+}
+
+/// Rewrite the source IPv4 address in a packet.
+pub fn rewrite_ipv4_src(packet: &mut [u8], new_src: std::net::Ipv4Addr) {
+    let octets = new_src.octets();
+    packet[12..16].copy_from_slice(&octets);
+}
+
+/// Rewrite the TCP/UDP destination port (offset 2-3 within transport header).
+pub fn rewrite_dst_port(packet: &mut [u8], ip_header_len: usize, new_port: u16) {
+    let bytes = new_port.to_be_bytes();
+    packet[ip_header_len + 2] = bytes[0];
+    packet[ip_header_len + 3] = bytes[1];
+}
+
+/// Rewrite the TCP/UDP source port (offset 0-1 within transport header).
+pub fn rewrite_src_port(packet: &mut [u8], ip_header_len: usize, new_port: u16) {
+    let bytes = new_port.to_be_bytes();
+    packet[ip_header_len] = bytes[0];
+    packet[ip_header_len + 1] = bytes[1];
+}
+
+/// Recalculate the IPv4 header checksum (RFC 1071).
+pub fn recalculate_ipv4_checksum(packet: &mut [u8]) {
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    // Zero out existing checksum
+    packet[10] = 0;
+    packet[11] = 0;
+
+    let checksum = internet_checksum(&packet[..ihl]);
+    packet[10] = (checksum >> 8) as u8;
+    packet[11] = (checksum & 0xFF) as u8;
+}
+
+/// Recalculate the TCP checksum.
+///
+/// The TCP checksum covers a pseudo-header (src IP, dst IP, zero, protocol, TCP length)
+/// plus the entire TCP segment.
+pub fn recalculate_tcp_checksum(packet: &mut [u8]) {
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let tcp_len = total_len - ihl;
+
+    // Zero out existing TCP checksum (offset 16 within TCP header)
+    packet[ihl + 16] = 0;
+    packet[ihl + 17] = 0;
+
+    // Build pseudo-header
+    let mut pseudo = Vec::with_capacity(12 + tcp_len);
+    pseudo.extend_from_slice(&packet[12..16]); // src IP
+    pseudo.extend_from_slice(&packet[16..20]); // dst IP
+    pseudo.push(0); // zero
+    pseudo.push(packet[9]); // protocol (TCP = 6)
+    pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes()); // TCP length
+    pseudo.extend_from_slice(&packet[ihl..ihl + tcp_len]); // TCP segment
+
+    let checksum = internet_checksum(&pseudo);
+    packet[ihl + 16] = (checksum >> 8) as u8;
+    packet[ihl + 17] = (checksum & 0xFF) as u8;
+}
+
+/// Recalculate the UDP checksum.
+pub fn recalculate_udp_checksum(packet: &mut [u8]) {
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let udp_len = total_len - ihl;
+
+    // Zero out existing UDP checksum (offset 6 within UDP header)
+    packet[ihl + 6] = 0;
+    packet[ihl + 7] = 0;
+
+    // Build pseudo-header
+    let mut pseudo = Vec::with_capacity(12 + udp_len);
+    pseudo.extend_from_slice(&packet[12..16]); // src IP
+    pseudo.extend_from_slice(&packet[16..20]); // dst IP
+    pseudo.push(0);
+    pseudo.push(packet[9]); // protocol (UDP = 17)
+    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&packet[ihl..ihl + udp_len]);
+
+    let checksum = internet_checksum(&pseudo);
+    // UDP checksum of 0x0000 means "no checksum"; if the computed value is 0, use 0xFFFF
+    let checksum = if checksum == 0 { 0xFFFF } else { checksum };
+    packet[ihl + 6] = (checksum >> 8) as u8;
+    packet[ihl + 7] = (checksum & 0xFF) as u8;
+}
+
+/// RFC 1071 internet checksum.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+
+    // Handle odd byte
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+
+    // Fold 32-bit sum to 16 bits
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    !(sum as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +298,80 @@ mod tests {
         let transport = parse_transport(&packet, &ip).unwrap();
         assert_eq!(transport.src_port, 1024);
         assert_eq!(transport.dst_port, 80);
+    }
+
+    #[test]
+    fn test_rewrite_ipv4_dst() {
+        #[rustfmt::skip]
+        let mut packet: Vec<u8> = vec![
+            0x45, 0x00, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x00,
+            0x40, 0x06, 0x00, 0x00,
+            0xC0, 0xA8, 0x01, 0x01, // src: 192.168.1.1
+            0x08, 0x08, 0x08, 0x08, // dst: 8.8.8.8
+            // TCP header (minimum for ports)
+            0x04, 0x00, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x50, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        rewrite_ipv4_dst(&mut packet, std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let ip = parse_ip_packet(&packet).unwrap();
+        assert_eq!(
+            ip.dst_addr,
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_ipv4_checksum_roundtrip() {
+        #[rustfmt::skip]
+        let mut packet: Vec<u8> = vec![
+            0x45, 0x00, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x00,
+            0x40, 0x06, 0x00, 0x00,
+            0xC0, 0xA8, 0x01, 0x01,
+            0x08, 0x08, 0x08, 0x08,
+            // TCP header
+            0x04, 0x00, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x50, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        recalculate_ipv4_checksum(&mut packet);
+
+        // Verify: computing checksum over the header including the checksum should yield 0
+        let ihl = ((packet[0] & 0x0F) as usize) * 4;
+        let verify = internet_checksum(&packet[..ihl]);
+        assert_eq!(verify, 0, "IPv4 header checksum verification failed");
+    }
+
+    #[test]
+    fn test_rewrite_ports() {
+        #[rustfmt::skip]
+        let mut packet: Vec<u8> = vec![
+            0x45, 0x00, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x00,
+            0x40, 0x06, 0x00, 0x00,
+            0xC0, 0xA8, 0x01, 0x01,
+            0x08, 0x08, 0x08, 0x08,
+            0x04, 0x00, 0x00, 0x50, // src:1024, dst:80
+            0x00, 0x00, 0x00, 0x00,
+            0x50, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        rewrite_dst_port(&mut packet, 20, 8080);
+        rewrite_src_port(&mut packet, 20, 54321);
+
+        let ip = parse_ip_packet(&packet).unwrap();
+        let transport = parse_transport(&packet, &ip).unwrap();
+        assert_eq!(transport.dst_port, 8080);
+        assert_eq!(transport.src_port, 54321);
     }
 }
