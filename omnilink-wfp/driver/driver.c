@@ -1,11 +1,9 @@
 /*
- * OmniLink WFP Callout Driver - Skeleton Implementation
+ * OmniLink WFP Callout Driver
  *
- * This is a skeleton for a WFP callout driver that intercepts
- * outgoing TCP connections at the ALE_CONNECT_REDIRECT layer
- * and redirects them to a local proxy.
- *
- * TODO: This requires WDK to compile. See README.md for build instructions.
+ * Hooks ALE_CONNECT_REDIRECT_V4 to intercept outgoing TCP connections
+ * and redirect them to a local proxy. The proxy queries original
+ * destinations via IOCTL.
  */
 
 #include "driver.h"
@@ -218,14 +216,22 @@ void NTAPI ClassifyConnectV4(
     FWPS_CONNECT_REQUEST0* connectRequest = NULL;
     UINT32 remoteAddr;
     UINT16 remotePort;
+    UINT32 localAddr;
+    UINT16 localPort;
     UINT64 processId;
+    UINT64 classifyHandle = 0;
+    NTSTATUS status;
 
     UNREFERENCED_PARAMETER(classifyContext);
-    UNREFERENCED_PARAMETER(filter);
     UNREFERENCED_PARAMETER(flowContext);
 
     if (!g_config.enabled || !layerData) {
         classifyOut->actionType = FWP_ACTION_PERMIT;
+        return;
+    }
+
+    /* Check if we can modify */
+    if (!(classifyOut->rights & FWPS_RIGHT_ACTION_WRITE)) {
         return;
     }
 
@@ -242,31 +248,81 @@ void NTAPI ClassifyConnectV4(
         return;
     }
 
-    /* Extract original destination */
+    /* Extract addresses (host byte order from WFP fixed values) */
     remoteAddr = inFixedValues->incomingValue[
         FWPS_FIELD_ALE_CONNECT_REDIRECT_V4_IP_REMOTE_ADDRESS].value.uint32;
     remotePort = inFixedValues->incomingValue[
         FWPS_FIELD_ALE_CONNECT_REDIRECT_V4_IP_REMOTE_PORT].value.uint16;
+    localAddr = inFixedValues->incomingValue[
+        FWPS_FIELD_ALE_CONNECT_REDIRECT_V4_IP_LOCAL_ADDRESS].value.uint32;
+    localPort = inFixedValues->incomingValue[
+        FWPS_FIELD_ALE_CONNECT_REDIRECT_V4_IP_LOCAL_PORT].value.uint16;
 
     /* Skip loopback */
-    if (remoteAddr == 0x7F000001) { /* 127.0.0.1 in host byte order */
+    if ((remoteAddr & 0xFF000000) == 0x7F000000) { /* 127.0.0.0/8 */
         classifyOut->actionType = FWP_ACTION_PERMIT;
+        InterlockedIncrement64((LONG64*)&g_stats.total_passed);
         return;
     }
 
-    /* Get the connect request for modification */
-    /* TODO: Use FwpsAcquireClassifyHandle0 + FwpsAcquireWritableLayerDataPointer0
-       to get a writable FWPS_CONNECT_REQUEST0 and modify the remote address/port.
-       This is the core redirection logic:
-       1. Save original destination to NAT table
-       2. Set connectRequest->remoteAddressAndPort to proxy address
-       3. Set connectRequest->localRedirectTargetPID
-       4. Call FwpsApplyModifiedLayerData0
-    */
+    /* Acquire classify handle for modification */
+    status = FwpsAcquireClassifyHandle0(classifyOut, 0, &classifyHandle);
+    if (!NT_SUCCESS(status)) {
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        InterlockedIncrement64((LONG64*)&g_stats.total_passed);
+        return;
+    }
 
-    /* For now, just permit */
+    /* Get writable connect request */
+    status = FwpsAcquireWritableLayerDataPointer0(
+        classifyHandle,
+        filter->filterId,
+        0,
+        (PVOID*)&connectRequest,
+        classifyOut
+    );
+    if (!NT_SUCCESS(status) || !connectRequest) {
+        FwpsReleaseClassifyHandle0(classifyHandle);
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        InterlockedIncrement64((LONG64*)&g_stats.total_passed);
+        return;
+    }
+
+    /* Save original destination + PID to NAT table */
+    status = NatInsert(localAddr, localPort, remoteAddr, remotePort, (UINT32)processId);
+    if (status == STATUS_INSUFFICIENT_RESOURCES) {
+        /* Table full: clean expired entries and retry */
+        NatCleanupExpired();
+        status = NatInsert(localAddr, localPort, remoteAddr, remotePort, (UINT32)processId);
+    }
+    if (!NT_SUCCESS(status)) {
+        FwpsApplyModifiedLayerData0(classifyHandle, connectRequest, 0);
+        FwpsReleaseClassifyHandle0(classifyHandle);
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        InterlockedIncrement64((LONG64*)&g_stats.total_passed);
+        return;
+    }
+
+    /* Redirect: set remote address to local proxy */
+    {
+        SOCKADDR_IN* remoteAddrPtr = (SOCKADDR_IN*)&connectRequest->remoteAddressAndPort;
+        remoteAddrPtr->sin_family = AF_INET;
+        remoteAddrPtr->sin_addr.S_un.S_addr = RtlUlongByteSwap(g_config.proxy_addr);
+        remoteAddrPtr->sin_port = RtlUshortByteSwap(g_config.proxy_port);
+    }
+
+    /* Set redirect target PID and handle */
+    connectRequest->localRedirectTargetPID = g_config.proxy_pid;
+    connectRequest->localRedirectHandle = g_redirect_handle;
+
+    /* Apply changes */
+    FwpsApplyModifiedLayerData0(classifyHandle, connectRequest, 0);
+    FwpsReleaseClassifyHandle0(classifyHandle);
+
     classifyOut->actionType = FWP_ACTION_PERMIT;
-    InterlockedIncrement64((LONG64*)&g_stats.total_passed);
+    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+
+    InterlockedIncrement64((LONG64*)&g_stats.total_intercepted);
 }
 
 NTSTATUS NTAPI NotifyConnectV4(
@@ -315,9 +371,14 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             irpSp->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(ORIGINAL_DST_RESULT)) {
             PORIGINAL_DST_QUERY query = (PORIGINAL_DST_QUERY)Irp->AssociatedIrp.SystemBuffer;
             PORIGINAL_DST_RESULT result = (PORIGINAL_DST_RESULT)Irp->AssociatedIrp.SystemBuffer;
+            UINT32 orig_addr, proc_id;
+            UINT16 orig_port;
 
             status = NatLookup(query->src_addr, query->src_port,
-                             &result->original_addr, &result->original_port);
+                             &orig_addr, &orig_port, &proc_id);
+            result->original_addr = orig_addr;
+            result->original_port = orig_port;
+            result->process_id = proc_id;
             result->found = NT_SUCCESS(status);
             info = sizeof(ORIGINAL_DST_RESULT);
             status = STATUS_SUCCESS;
@@ -349,7 +410,8 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 /* ---- NAT Table Operations ---- */
 
 NTSTATUS NatInsert(UINT32 src_addr, UINT16 src_port,
-                   UINT32 original_addr, UINT16 original_port)
+                   UINT32 original_addr, UINT16 original_port,
+                   UINT32 process_id)
 {
     KIRQL oldIrql;
     ULONG i;
@@ -362,9 +424,11 @@ NTSTATUS NatInsert(UINT32 src_addr, UINT16 src_port,
             g_nat_table[i].src_port = src_port;
             g_nat_table[i].original_dst_addr = original_addr;
             g_nat_table[i].original_dst_port = original_port;
+            g_nat_table[i].process_id = process_id;
             KeQuerySystemTime(&g_nat_table[i].timestamp);
             g_nat_table[i].in_use = TRUE;
 
+            InterlockedIncrement64((LONG64*)&g_stats.active_nat_entries);
             KeReleaseSpinLock(&g_nat_lock, oldIrql);
             return STATUS_SUCCESS;
         }
@@ -375,7 +439,8 @@ NTSTATUS NatInsert(UINT32 src_addr, UINT16 src_port,
 }
 
 NTSTATUS NatLookup(UINT32 src_addr, UINT16 src_port,
-                   PUINT32 original_addr, PUINT16 original_port)
+                   PUINT32 original_addr, PUINT16 original_port,
+                   PUINT32 process_id)
 {
     KIRQL oldIrql;
     ULONG i;
@@ -389,9 +454,11 @@ NTSTATUS NatLookup(UINT32 src_addr, UINT16 src_port,
 
             *original_addr = g_nat_table[i].original_dst_addr;
             *original_port = g_nat_table[i].original_dst_port;
+            *process_id = g_nat_table[i].process_id;
 
             /* Remove entry after lookup */
             g_nat_table[i].in_use = FALSE;
+            InterlockedDecrement64((LONG64*)&g_stats.active_nat_entries);
 
             KeReleaseSpinLock(&g_nat_lock, oldIrql);
             return STATUS_SUCCESS;
@@ -404,5 +471,22 @@ NTSTATUS NatLookup(UINT32 src_addr, UINT16 src_port,
 
 void NatCleanupExpired(void)
 {
-    /* TODO: Implement TTL-based cleanup using g_nat_table[i].timestamp */
+    KIRQL oldIrql;
+    LARGE_INTEGER now;
+    ULONG i;
+
+    KeQuerySystemTime(&now);
+    KeAcquireSpinLock(&g_nat_lock, &oldIrql);
+
+    for (i = 0; i < MAX_NAT_ENTRIES; i++) {
+        if (g_nat_table[i].in_use) {
+            LONGLONG age = now.QuadPart - g_nat_table[i].timestamp.QuadPart;
+            if (age > NAT_ENTRY_TTL) {
+                g_nat_table[i].in_use = FALSE;
+                InterlockedDecrement64((LONG64*)&g_stats.active_nat_entries);
+            }
+        }
+    }
+
+    KeReleaseSpinLock(&g_nat_lock, oldIrql);
 }

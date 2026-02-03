@@ -42,7 +42,7 @@ fn main() -> Result<()> {
                 let peer = stream.peer_addr().ok();
                 if let Some(peer) = peer {
                     // Query original destination from the driver's NAT table
-                    if let Ok(Some((orig_addr, orig_port))) = client.get_original_dst(
+                    if let Ok(Some((orig_addr, orig_port, process_id))) = client.get_original_dst(
                         u32::from(match peer.ip() {
                             std::net::IpAddr::V4(v4) => v4,
                             _ => continue,
@@ -51,10 +51,11 @@ fn main() -> Result<()> {
                     ) {
                         let orig_ip = Ipv4Addr::from(orig_addr);
                         println!(
-                            "[omnilink-wfp] Connection from {} -> original dest {}:{}",
-                            peer, orig_ip, orig_port
+                            "[omnilink-wfp] Connection from {} -> original dest {}:{} (pid={})",
+                            peer, orig_ip, orig_port, process_id
                         );
                         // TODO: Forward through proxy chain via omnilink-core
+                        // TODO: Resolve process path via QueryFullProcessImageNameW(process_id)
                     }
                 }
             }

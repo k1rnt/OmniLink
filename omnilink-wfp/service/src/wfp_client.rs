@@ -49,11 +49,12 @@ pub struct OriginalDstQuery {
     pub src_port: u16,
 }
 
-/// Result of original destination lookup.
+/// Result of original destination lookup (field order matches C driver).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OriginalDstResult {
     pub original_addr: u32,
+    pub process_id: u32,
     pub original_port: u16,
     pub found: u8,
 }
@@ -119,10 +120,11 @@ impl WfpClient {
         &self,
         src_addr: u32,
         src_port: u16,
-    ) -> Result<Option<(u32, u16)>> {
+    ) -> Result<Option<(u32, u16, u32)>> {
         let query = OriginalDstQuery { src_addr, src_port };
         let mut result = OriginalDstResult {
             original_addr: 0,
+            process_id: 0,
             original_port: 0,
             found: 0,
         };
@@ -143,7 +145,7 @@ impl WfpClient {
         }
 
         if result.found != 0 {
-            Ok(Some((result.original_addr, result.original_port)))
+            Ok(Some((result.original_addr, result.original_port, result.process_id)))
         } else {
             Ok(None)
         }

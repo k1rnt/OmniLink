@@ -21,6 +21,7 @@
 #include <fwpsk.h>
 #include <fwpmk.h>
 #include <ntstrsafe.h>
+#include <ws2ipdef.h>
 
 /* Device name for user-mode IOCTL communication */
 #define OMNILINK_DEVICE_NAME    L"\\Device\\OmniLinkWFP"
@@ -39,20 +40,24 @@
 /* Maximum number of NAT entries */
 #define MAX_NAT_ENTRIES 65536
 
+/* NAT entry TTL: 30 seconds in 100-nanosecond units */
+#define NAT_ENTRY_TTL (30LL * 10000000LL)
+
 /* NAT entry: maps a rewritten connection to the original destination */
 typedef struct _NAT_ENTRY {
-    UINT32 src_addr;         /* Source IPv4 address (network byte order) */
-    UINT16 src_port;         /* Source port (network byte order) */
-    UINT32 original_dst_addr; /* Original destination IPv4 (network byte order) */
-    UINT16 original_dst_port; /* Original destination port (network byte order) */
+    UINT32 src_addr;         /* Source IPv4 address (host byte order) */
+    UINT16 src_port;         /* Source port (host byte order) */
+    UINT32 original_dst_addr; /* Original destination IPv4 (host byte order) */
+    UINT16 original_dst_port; /* Original destination port (host byte order) */
+    UINT32 process_id;       /* PID of the originating process */
     LARGE_INTEGER timestamp;  /* Entry creation time */
     BOOLEAN in_use;
 } NAT_ENTRY, *PNAT_ENTRY;
 
 /* Driver configuration set by user-mode service */
 typedef struct _DRIVER_CONFIG {
-    UINT32 proxy_addr;   /* Local proxy address (127.0.0.1, network byte order) */
-    UINT16 proxy_port;   /* Local proxy port (network byte order) */
+    UINT32 proxy_addr;   /* Local proxy address (host byte order) */
+    UINT16 proxy_port;   /* Local proxy port (host byte order) */
     UINT32 proxy_pid;    /* PID of the proxy process (excluded from interception) */
     BOOLEAN enabled;     /* Whether interception is active */
 } DRIVER_CONFIG, *PDRIVER_CONFIG;
@@ -63,9 +68,10 @@ typedef struct _ORIGINAL_DST_QUERY {
     UINT16 src_port;
 } ORIGINAL_DST_QUERY, *PORIGINAL_DST_QUERY;
 
-/* IOCTL output for original destination */
+/* IOCTL output for original destination (field order chosen to avoid padding) */
 typedef struct _ORIGINAL_DST_RESULT {
     UINT32 original_addr;
+    UINT32 process_id;
     UINT16 original_port;
     BOOLEAN found;
 } ORIGINAL_DST_RESULT, *PORIGINAL_DST_RESULT;
@@ -76,6 +82,10 @@ typedef struct _DRIVER_STATS {
     UINT64 total_passed;
     UINT64 active_nat_entries;
 } DRIVER_STATS, *PDRIVER_STATS;
+
+/* IRP dispatch */
+NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 /* Function prototypes */
 DRIVER_INITIALIZE DriverEntry;
@@ -106,7 +116,9 @@ NTSTATUS NTAPI NotifyConnectV4(
 
 /* NAT table operations */
 NTSTATUS NatInsert(UINT32 src_addr, UINT16 src_port,
-                   UINT32 original_addr, UINT16 original_port);
+                   UINT32 original_addr, UINT16 original_port,
+                   UINT32 process_id);
 NTSTATUS NatLookup(UINT32 src_addr, UINT16 src_port,
-                   PUINT32 original_addr, PUINT16 original_port);
+                   PUINT32 original_addr, PUINT16 original_port,
+                   PUINT32 process_id);
 void NatCleanupExpired(void);

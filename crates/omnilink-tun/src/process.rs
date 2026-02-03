@@ -34,10 +34,17 @@ pub fn lookup_process_by_socket(local_addr: &SocketAddr) -> Option<ProcessInfo> 
 }
 
 /// Resolve process name and path from a PID.
-/// Used by eBPF interceptor which already knows the PID.
+/// Used by eBPF interceptor (Linux) and WFP service (Windows) which already know the PID.
 #[cfg(target_os = "linux")]
 pub fn resolve_pid(pid: u32) -> Option<ProcessInfo> {
     linux::resolve_pid_info(pid)
+}
+
+/// Resolve process name and path from a PID (Windows).
+/// The PID comes from the WFP driver IOCTL, not from socket scanning.
+#[cfg(target_os = "windows")]
+pub fn resolve_pid(pid: u32) -> Option<ProcessInfo> {
+    windows::resolve_pid_info(pid)
 }
 
 // ---- macOS implementation ----
@@ -520,6 +527,53 @@ mod linux {
         let exe_path = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
         let path = exe_path.to_string_lossy().to_string();
         let name = exe_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        Some(ProcessInfo { pid, name, path })
+    }
+}
+
+// ---- Windows implementation ----
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const MAX_PATH: usize = 260;
+
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn CloseHandle(hObject: isize) -> i32;
+        fn QueryFullProcessImageNameW(
+            hProcess: isize,
+            dwFlags: u32,
+            lpExeName: *mut u16,
+            lpdwSize: *mut u32,
+        ) -> i32;
+    }
+
+    pub(super) fn resolve_pid_info(pid: u32) -> Option<ProcessInfo> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle == 0 {
+            return None;
+        }
+
+        let mut buf = [0u16; MAX_PATH];
+        let mut size = MAX_PATH as u32;
+        let ok = unsafe {
+            QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size)
+        };
+        unsafe { CloseHandle(handle); }
+
+        if ok == 0 {
+            return None;
+        }
+
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        let name = std::path::Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
