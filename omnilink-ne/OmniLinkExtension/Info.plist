@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.omnilink.ne-extension</string>
+    <key>CFBundleName</key>
+    <string>OmniLinkExtension</string>
+    <key>CFBundleDisplayName</key>
+    <string>OmniLink Network Extension</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>OmniLink needs a system extension to transparently intercept and route network traffic through configured proxies.</string>
+    <key>NetworkExtension</key>
+    <dict>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.transparent-proxy</key>
+            <string>$(PRODUCT_MODULE_NAME).TransparentProxyProvider</string>
+        </dict>
+    </dict>
+</dict>
+</plist>
