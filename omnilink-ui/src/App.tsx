@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import ConnectionsView from "./components/ConnectionsView";
 import RulesView from "./components/RulesView";
 import ProxiesView from "./components/ProxiesView";
@@ -14,11 +15,41 @@ function App() {
     listen_addr: "127.0.0.1:1080",
     total_connections: 0,
     active_connections: 0,
-    dns_mode: "fake_ip",
+    dns_mode: "FakeIp",
   });
 
-  const toggleService = () => {
-    setAppState((prev) => ({ ...prev, running: !prev.running }));
+  const fetchStatus = useCallback(async () => {
+    try {
+      const status = await invoke<AppState & { total_sent: number; total_received: number }>("get_status");
+      setAppState({
+        running: status.running,
+        listen_addr: status.listen_addr,
+        total_connections: status.total_connections,
+        active_connections: status.active_connections,
+        dns_mode: status.dns_mode,
+      });
+    } catch (e) {
+      console.error("Failed to fetch status:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 2000);
+    return () => clearInterval(interval);
+  }, [fetchStatus]);
+
+  const toggleService = async () => {
+    try {
+      if (appState.running) {
+        await invoke("stop_service");
+      } else {
+        await invoke("start_service");
+      }
+      await fetchStatus();
+    } catch (e) {
+      console.error("Service toggle error:", e);
+    }
   };
 
   return (

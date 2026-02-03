@@ -1,63 +1,6 @@
-import { useState, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { Session } from "../types";
-
-const MOCK_SESSIONS: Session[] = [
-  {
-    id: 1,
-    status: "active",
-    process_name: "chrome.exe",
-    destination: "google.com:443",
-    proxy_name: "my-socks5",
-    action: "proxy:my-socks5",
-    bytes_sent: 15420,
-    bytes_received: 128300,
-    elapsed_ms: 5200,
-  },
-  {
-    id: 2,
-    status: "active",
-    process_name: "firefox",
-    destination: "github.com:443",
-    proxy_name: null,
-    action: "direct",
-    bytes_sent: 8100,
-    bytes_received: 45600,
-    elapsed_ms: 3100,
-  },
-  {
-    id: 3,
-    status: "closed",
-    process_name: "curl",
-    destination: "api.example.com:443",
-    proxy_name: "my-socks5",
-    action: "proxy:my-socks5",
-    bytes_sent: 512,
-    bytes_received: 2048,
-    elapsed_ms: 1500,
-  },
-  {
-    id: 4,
-    status: "connecting",
-    process_name: "docker",
-    destination: "registry.docker.io:443",
-    proxy_name: "my-socks5",
-    action: "proxy:my-socks5",
-    bytes_sent: 0,
-    bytes_received: 0,
-    elapsed_ms: 100,
-  },
-  {
-    id: 5,
-    status: "active",
-    process_name: "node",
-    destination: "registry.npmjs.org:443",
-    proxy_name: null,
-    action: "direct",
-    bytes_sent: 2048,
-    bytes_received: 65536,
-    elapsed_ms: 800,
-  },
-];
 
 type FilterMode = "all" | "active" | "closed";
 
@@ -96,12 +39,27 @@ interface ContextMenuState {
 }
 
 function ConnectionsView() {
-  const [sessions] = useState<Session[]>(MOCK_SESSIONS);
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [filter, setFilter] = useState<FilterMode>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     visible: false, x: 0, y: 0, session: null,
   });
+
+  const fetchSessions = useCallback(async () => {
+    try {
+      const data = await invoke<Session[]>("get_sessions");
+      setSessions(data);
+    } catch (e) {
+      console.error("Failed to fetch sessions:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSessions();
+    const interval = setInterval(fetchSessions, 1000);
+    return () => clearInterval(interval);
+  }, [fetchSessions]);
 
   const filteredSessions = sessions.filter((s) => {
     if (filter === "active" && s.status !== "active" && s.status !== "connecting") return false;
