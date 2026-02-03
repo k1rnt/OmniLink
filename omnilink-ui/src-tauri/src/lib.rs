@@ -27,6 +27,8 @@ pub struct AppStateInner {
     virtual_dns: Arc<VirtualDns>,
     chain_relay: Option<Arc<ChainRelay>>,
     sysproxy_enabled: bool,
+    /// Abort handles for individual connections, keyed by session ID.
+    connection_handles: Arc<tokio::sync::Mutex<HashMap<u64, tokio_util::sync::CancellationToken>>>,
 }
 
 pub type SharedState = Mutex<AppStateInner>;
@@ -190,6 +192,7 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
     let virtual_dns = state_guard.virtual_dns.clone();
     let session_manager = state_guard.session_manager.clone();
     let traffic_stats = state_guard.traffic_stats.clone();
+    let connection_handles = state_guard.connection_handles.clone();
 
     let handle = tokio::spawn(async move {
         if let Err(e) = run_service(
@@ -199,6 +202,7 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
             chain_relay,
             session_manager,
             traffic_stats,
+            connection_handles,
         )
         .await
         {
@@ -533,6 +537,20 @@ async fn get_sysproxy_status(state: State<'_, SharedState>) -> Result<bool, Stri
     Ok(state.sysproxy_enabled)
 }
 
+// --- Connection termination ---
+
+#[tauri::command]
+async fn terminate_session(state: State<'_, SharedState>, session_id: u64) -> Result<String, String> {
+    let state = state.lock().await;
+    let handles = state.connection_handles.lock().await;
+    if let Some(token) = handles.get(&session_id) {
+        token.cancel();
+        Ok(format!("Session {} terminated", session_id))
+    } else {
+        Err(format!("Session {} not found or already closed", session_id))
+    }
+}
+
 // --- Save config ---
 
 #[tauri::command]
@@ -551,6 +569,7 @@ async fn run_service(
     chain_relay: Arc<ChainRelay>,
     session_manager: Arc<SessionManager>,
     traffic_stats: Arc<TrafficStats>,
+    connection_handles: Arc<tokio::sync::Mutex<HashMap<u64, tokio_util::sync::CancellationToken>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!(addr = %listen_addr, "tauri service listening");
@@ -564,6 +583,7 @@ async fn run_service(
         let chain_relay = chain_relay.clone();
         let session_manager = session_manager.clone();
         let traffic_stats = traffic_stats.clone();
+        let connection_handles = connection_handles.clone();
 
         tokio::spawn(async move {
             let result = handle_connection(
@@ -573,6 +593,7 @@ async fn run_service(
                 &chain_relay,
                 &session_manager,
                 &traffic_stats,
+                &connection_handles,
             )
             .await;
 
@@ -590,6 +611,7 @@ async fn handle_connection(
     chain_relay: &ChainRelay,
     session_manager: &SessionManager,
     traffic_stats: &TrafficStats,
+    connection_handles: &Arc<tokio::sync::Mutex<HashMap<u64, tokio_util::sync::CancellationToken>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use omnilink_core::proxy::ProxyDestination;
     use omnilink_core::rule::{Action, MatchContext};
@@ -701,13 +723,21 @@ async fn handle_connection(
         dest_domain.as_deref(),
     );
 
-    match action {
+    // Register a cancellation token for this session
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    connection_handles
+        .lock()
+        .await
+        .insert(session_id, cancel_token.clone());
+
+    let result = match action {
         Action::Block => {
             inbound
                 .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await?;
             session_manager.update_status(session_id, SessionStatus::Closed);
             traffic_stats.record_connection_close();
+            Ok(())
         }
         Action::Direct => {
             let target_addr = match &dest {
@@ -724,13 +754,21 @@ async fn handle_connection(
 
                     let (mut ri, mut wi) = inbound.split();
                     let (mut ro, mut wo) = outbound.split();
-                    let _ = tokio::try_join!(
-                        tokio::io::copy(&mut ri, &mut wo),
-                        tokio::io::copy(&mut ro, &mut wi),
-                    );
+                    tokio::select! {
+                        result = async {
+                            tokio::try_join!(
+                                tokio::io::copy(&mut ri, &mut wo),
+                                tokio::io::copy(&mut ro, &mut wi),
+                            )
+                        } => { let _ = result; }
+                        _ = cancel_token.cancelled() => {
+                            tracing::info!(session_id, "connection terminated by user");
+                        }
+                    }
 
                     session_manager.update_status(session_id, SessionStatus::Closed);
                     traffic_stats.record_connection_close();
+                    Ok(())
                 }
                 Err(e) => {
                     inbound
@@ -741,7 +779,7 @@ async fn handle_connection(
                         SessionStatus::Error(e.to_string()),
                     );
                     traffic_stats.record_connection_close();
-                    return Err(e.into());
+                    Err(e.into())
                 }
             }
         }
@@ -757,13 +795,21 @@ async fn handle_connection(
 
                     let (mut ri, mut wi) = inbound.split();
                     let (mut ro, mut wo) = outbound.split();
-                    let _ = tokio::try_join!(
-                        tokio::io::copy(&mut ri, &mut wo),
-                        tokio::io::copy(&mut ro, &mut wi),
-                    );
+                    tokio::select! {
+                        result = async {
+                            tokio::try_join!(
+                                tokio::io::copy(&mut ri, &mut wo),
+                                tokio::io::copy(&mut ro, &mut wi),
+                            )
+                        } => { let _ = result; }
+                        _ = cancel_token.cancelled() => {
+                            tracing::info!(session_id, "connection terminated by user");
+                        }
+                    }
 
                     session_manager.update_status(session_id, SessionStatus::Closed);
                     traffic_stats.record_connection_close();
+                    Ok(())
                 }
                 Err(e) => {
                     inbound
@@ -775,13 +821,16 @@ async fn handle_connection(
                         SessionStatus::Error(e.to_string()),
                     );
                     traffic_stats.record_connection_close();
-                    return Err(e.into());
+                    Err(e.into())
                 }
             }
         }
-    }
+    };
 
-    Ok(())
+    // Remove the cancellation token after the connection ends
+    connection_handles.lock().await.remove(&session_id);
+
+    result
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -797,6 +846,7 @@ pub fn run() {
         virtual_dns: Arc::new(VirtualDns::new()),
         chain_relay: None,
         sysproxy_enabled: false,
+        connection_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     tauri::Builder::default()
@@ -821,6 +871,7 @@ pub fn run() {
             delete_chain,
             toggle_sysproxy,
             get_sysproxy_status,
+            terminate_session,
             save_config,
         ])
         .run(tauri::generate_context!())

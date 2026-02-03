@@ -84,18 +84,34 @@ function ConnectionsView() {
     setContextMenu((prev) => ({ ...prev, visible: false }));
   }, []);
 
-  const handleCreateRule = useCallback(() => {
+  const handleCreateRule = useCallback(async () => {
     if (contextMenu.session) {
       const s = contextMenu.session;
       const [host] = s.destination.split(":");
-      alert(`Create rule for:\n  Process: ${s.process_name ?? "Any"}\n  Host: ${host}\n  Action: ${s.action}`);
+      try {
+        await invoke("add_rule", {
+          req: {
+            name: `rule-${host}`,
+            conditions: [{ type: "domain", value: host }],
+            action: s.action.startsWith("proxy:") ? "proxy" : s.action,
+            proxy_name: s.action.startsWith("proxy:") ? s.action.replace("proxy:", "") : null,
+            priority: 100,
+          },
+        });
+      } catch (e) {
+        console.error("Failed to create rule:", e);
+      }
     }
     closeContextMenu();
   }, [contextMenu.session, closeContextMenu]);
 
-  const handleTerminate = useCallback(() => {
+  const handleTerminate = useCallback(async () => {
     if (contextMenu.session) {
-      alert(`Terminate connection #${contextMenu.session.id}`);
+      try {
+        await invoke("terminate_session", { sessionId: contextMenu.session.id });
+      } catch (e) {
+        console.error("Failed to terminate session:", e);
+      }
     }
     closeContextMenu();
   }, [contextMenu.session, closeContextMenu]);
