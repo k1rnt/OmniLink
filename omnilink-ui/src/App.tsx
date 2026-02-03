@@ -4,9 +4,10 @@ import ConnectionsView from "./components/ConnectionsView";
 import RulesView from "./components/RulesView";
 import ProxiesView from "./components/ProxiesView";
 import SettingsView from "./components/SettingsView";
+import TrafficView from "./components/TrafficView";
 import type { AppState } from "./types";
 
-type Tab = "connections" | "rules" | "proxies" | "settings";
+type Tab = "connections" | "rules" | "proxies" | "traffic" | "settings";
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("connections");
@@ -68,7 +69,7 @@ function App() {
       </div>
 
       <div className="nav-tabs">
-        {(["connections", "rules", "proxies", "settings"] as Tab[]).map((tab) => (
+        {(["connections", "rules", "proxies", "traffic", "settings"] as Tab[]).map((tab) => (
           <button
             key={tab}
             className={`nav-tab ${activeTab === tab ? "active" : ""}`}
@@ -83,6 +84,7 @@ function App() {
         {activeTab === "connections" && <ConnectionsView />}
         {activeTab === "rules" && <RulesView />}
         {activeTab === "proxies" && <ProxiesView />}
+        {activeTab === "traffic" && <TrafficView />}
         {activeTab === "settings" && <SettingsView state={appState} />}
       </div>
 

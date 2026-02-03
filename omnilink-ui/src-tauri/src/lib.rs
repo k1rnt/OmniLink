@@ -194,6 +194,15 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
     let traffic_stats = state_guard.traffic_stats.clone();
     let connection_handles = state_guard.connection_handles.clone();
 
+    // Spawn bandwidth sampling task (1 sample per second)
+    let bw_stats = state_guard.traffic_stats.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            bw_stats.sample_bandwidth();
+        }
+    });
+
     let handle = tokio::spawn(async move {
         if let Err(e) = run_service(
             &listen_addr,

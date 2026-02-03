@@ -4,6 +4,8 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+const BANDWIDTH_HISTORY_SIZE: usize = 60;
+
 /// Global traffic statistics tracker.
 pub struct TrafficStats {
     /// Total bytes sent across all connections.
@@ -18,6 +20,12 @@ pub struct TrafficStats {
     proxy_stats: Mutex<HashMap<String, ProxyTraffic>>,
     /// Per-destination domain traffic (top-N tracking).
     domain_stats: Mutex<HashMap<String, DomainTraffic>>,
+    /// Ring buffer of bandwidth samples (last 60 samples).
+    bandwidth_history: Mutex<Vec<BandwidthSample>>,
+    /// Previous total_sent snapshot for calculating bandwidth delta.
+    prev_sent: AtomicU64,
+    /// Previous total_received snapshot for calculating bandwidth delta.
+    prev_received: AtomicU64,
 }
 
 /// Traffic counters for a single proxy.
@@ -39,6 +47,13 @@ pub struct DomainTraffic {
     pub connection_count: u64,
 }
 
+/// A single bandwidth sample point.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BandwidthSample {
+    pub sent_bps: u64,
+    pub recv_bps: u64,
+}
+
 /// Snapshot of traffic statistics for serialization.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsSnapshot {
@@ -48,6 +63,7 @@ pub struct StatsSnapshot {
     pub active_connections: u64,
     pub top_proxies: Vec<ProxyTraffic>,
     pub top_domains: Vec<DomainTraffic>,
+    pub bandwidth_history: Vec<BandwidthSample>,
 }
 
 impl TrafficStats {
@@ -59,7 +75,30 @@ impl TrafficStats {
             active_connections: AtomicU64::new(0),
             proxy_stats: Mutex::new(HashMap::new()),
             domain_stats: Mutex::new(HashMap::new()),
+            bandwidth_history: Mutex::new(Vec::with_capacity(BANDWIDTH_HISTORY_SIZE)),
+            prev_sent: AtomicU64::new(0),
+            prev_received: AtomicU64::new(0),
         }
+    }
+
+    /// Sample current bandwidth and push to history ring buffer.
+    /// Call this periodically (e.g., every 1 second) to track bandwidth over time.
+    pub fn sample_bandwidth(&self) {
+        let current_sent = self.total_sent.load(Ordering::Relaxed);
+        let current_received = self.total_received.load(Ordering::Relaxed);
+        let prev_sent = self.prev_sent.swap(current_sent, Ordering::Relaxed);
+        let prev_received = self.prev_received.swap(current_received, Ordering::Relaxed);
+
+        let sample = BandwidthSample {
+            sent_bps: current_sent.saturating_sub(prev_sent),
+            recv_bps: current_received.saturating_sub(prev_received),
+        };
+
+        let mut history = self.bandwidth_history.lock().unwrap();
+        if history.len() >= BANDWIDTH_HISTORY_SIZE {
+            history.remove(0);
+        }
+        history.push(sample);
     }
 
     /// Record a new connection being established.
@@ -153,6 +192,8 @@ impl TrafficStats {
         });
         top_domains.truncate(top_n);
 
+        let bandwidth_history = self.bandwidth_history.lock().unwrap().clone();
+
         StatsSnapshot {
             total_sent: self.total_sent.load(Ordering::Relaxed),
             total_received: self.total_received.load(Ordering::Relaxed),
@@ -160,6 +201,7 @@ impl TrafficStats {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             top_proxies,
             top_domains,
+            bandwidth_history,
         }
     }
 
@@ -171,6 +213,9 @@ impl TrafficStats {
         self.active_connections.store(0, Ordering::Relaxed);
         self.proxy_stats.lock().unwrap().clear();
         self.domain_stats.lock().unwrap().clear();
+        self.bandwidth_history.lock().unwrap().clear();
+        self.prev_sent.store(0, Ordering::Relaxed);
+        self.prev_received.store(0, Ordering::Relaxed);
     }
 }
 
