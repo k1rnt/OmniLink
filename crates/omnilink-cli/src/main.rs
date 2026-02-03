@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use omnilink_core::config::Config;
@@ -15,6 +17,10 @@ struct Cli {
     /// Path to configuration file
     #[arg(short, long, default_value = "config.yaml")]
     config: PathBuf,
+
+    /// Log file directory (enables file logging)
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -40,9 +46,28 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("omnilink=info".parse()?))
-        .init();
+    let env_filter =
+        EnvFilter::from_default_env().add_directive("omnilink=info".parse()?);
+
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    // Optional file logging
+    let _guard = if let Some(ref log_dir) = cli.log_dir {
+        let file_appender = tracing_appender::rolling::daily(log_dir, "omnilink.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false);
+        registry.with(file_layer).init();
+        Some(guard)
+    } else {
+        registry.init();
+        None
+    };
 
     match cli.command {
         Commands::Run => cmd_run(&cli.config).await,
