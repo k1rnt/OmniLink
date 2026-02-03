@@ -26,6 +26,10 @@ pub struct InterceptedConnection {
     pub original_dst: SocketAddr,
     /// The source address of the connecting application.
     pub src_addr: SocketAddr,
+    /// The name of the process that owns this connection (e.g. "firefox").
+    pub process_name: Option<String>,
+    /// The full path of the process executable (e.g. "/Applications/Firefox.app/Contents/MacOS/firefox").
+    pub process_path: Option<String>,
 }
 
 /// Events emitted by the interceptor.

@@ -62,6 +62,8 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         addr: dst_addr,
         port: dst_port,
         _pad: 0,
+        pid,
+        _pad2: 0,
     };
     ORIGINAL_DESTS
         .insert(&key, &value, 0)

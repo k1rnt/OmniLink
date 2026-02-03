@@ -3,6 +3,7 @@ pub mod device;
 pub mod interceptor;
 pub mod nat;
 pub mod dns_intercept;
+pub mod process;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

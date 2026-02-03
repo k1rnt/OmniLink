@@ -731,8 +731,8 @@ async fn start_interceptor(state: State<'_, SharedState>) -> Result<String, Stri
                         };
 
                         let ctx = MatchContext {
-                            process_name: None,
-                            process_path: None,
+                            process_name: conn.process_name.clone(),
+                            process_path: conn.process_path.clone(),
                             process_user: None,
                             dest_domain: domain,
                             dest_ip: Some(dst_ip),

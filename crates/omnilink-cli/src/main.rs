@@ -453,8 +453,8 @@ async fn handle_intercepted_connection(
     };
 
     let ctx = MatchContext {
-        process_name: None,
-        process_path: None,
+        process_name: conn.process_name.clone(),
+        process_path: conn.process_path.clone(),
         process_user: None,
         dest_domain: domain.clone(),
         dest_ip: Some(dst_ip),
@@ -462,7 +462,12 @@ async fn handle_intercepted_connection(
     };
 
     let action = rule_engine.evaluate(&ctx);
-    tracing::info!(dest = %dest, action = ?action, "intercepted connection routing");
+    tracing::info!(
+        dest = %dest,
+        process = conn.process_name.as_deref().unwrap_or("unknown"),
+        action = ?action,
+        "intercepted connection routing"
+    );
 
     match action {
         Action::Block => {

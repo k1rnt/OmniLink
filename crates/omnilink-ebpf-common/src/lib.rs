@@ -20,6 +20,9 @@ pub struct OriginalDest {
     /// Port in network byte order.
     pub port: u16,
     pub _pad: u16,
+    /// PID of the process that initiated the connection.
+    pub pid: u32,
+    pub _pad2: u32,
 }
 
 #[cfg(feature = "user")]

@@ -177,9 +177,12 @@ async fn run_interceptor_loop(
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     if let Some(original_dst) = nat_accept.remove(&peer_addr) {
+                        let proc_info = crate::process::lookup_process_by_socket(&peer_addr);
                         let conn = InterceptedConnection {
                             original_dst,
                             src_addr: peer_addr,
+                            process_name: proc_info.as_ref().map(|p| p.name.clone()),
+                            process_path: proc_info.as_ref().map(|p| p.path.clone()),
                         };
                         if tx_accept.send(InterceptorEvent::NewConnection(conn, stream)).await.is_err() {
                             break;

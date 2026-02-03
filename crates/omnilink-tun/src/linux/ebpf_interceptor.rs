@@ -161,9 +161,12 @@ async fn accept_loop(listener: TcpListener, tx: mpsc::Sender<InterceptorEvent>) 
 
                 match original_dst {
                     Some(dst) => {
+                        let proc_info = crate::process::lookup_process_by_socket(&peer_addr);
                         let conn = InterceptedConnection {
                             original_dst: dst,
                             src_addr: peer_addr,
+                            process_name: proc_info.as_ref().map(|p| p.name.clone()),
+                            process_path: proc_info.as_ref().map(|p| p.path.clone()),
                         };
                         if tx
                             .send(InterceptorEvent::NewConnection(conn, stream))
