@@ -1,0 +1,15 @@
+[package]
+name = "omnilink-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+bytes = { workspace = true }
+ipnet = { workspace = true }
+regex = { workspace = true }

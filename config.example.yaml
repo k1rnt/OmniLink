@@ -1,0 +1,47 @@
+general:
+  listen_addr: "127.0.0.1:1080"
+  logging: true
+  log_level: info
+
+proxies:
+  - name: my-socks5
+    protocol: !Socks5
+    address: "proxy.example.com"
+    port: 1080
+    auth:
+      username: user
+      password: pass
+
+  - name: my-http
+    protocol: !Http
+    address: "httpproxy.example.com"
+    port: 8080
+
+chains:
+  - name: double-hop
+    proxies:
+      - my-socks5
+      - my-http
+
+rules:
+  - name: block-ads
+    conditions:
+      - !domain "*.ads.example.com"
+    action: !block
+    priority: 100
+
+  - name: proxy-private
+    conditions:
+      - !cidr "10.0.0.0/8"
+    action:
+      !proxy my-socks5
+    priority: 50
+
+  - name: direct-local
+    conditions:
+      - !cidr "192.168.0.0/16"
+    action: !direct
+    priority: 50
+
+dns:
+  mode: !fake_ip

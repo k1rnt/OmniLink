@@ -1,0 +1,15 @@
+[package]
+name = "omnilink-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+omnilink-core = { path = "../omnilink-core" }
+omnilink-tun = { path = "../omnilink-tun" }
+clap = { version = "4", features = ["derive"] }
