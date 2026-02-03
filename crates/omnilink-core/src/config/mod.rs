@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dns::DnsMode;
 use crate::proxy::{ProxyAuth, ProxyProtocol, ProxyServer};
-use crate::rule::Rule;
+use crate::rule::{Action, Rule};
 
 /// Top-level configuration for OmniLink.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,10 @@ pub struct Config {
     /// DNS settings.
     #[serde(default)]
     pub dns: DnsConfig,
+
+    /// Default action when no rule matches.
+    #[serde(default)]
+    pub default_action: Action,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,11 +93,34 @@ impl ProxyServerConfig {
     }
 }
 
+/// Proxy chain selection strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainMode {
+    /// All proxies in order; fail if any is unreachable.
+    Strict,
+    /// Try proxies in order; use the first reachable one (failover).
+    Failover,
+    /// Distribute connections across proxies.
+    RoundRobin,
+    /// Randomly select a proxy for each connection.
+    Random,
+}
+
+impl Default for ChainMode {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     pub name: String,
     /// Ordered list of proxy names to chain through.
     pub proxies: Vec<String>,
+    /// How to select proxies from the list.
+    #[serde(default)]
+    pub mode: ChainMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +157,28 @@ impl Config {
             chains: vec![],
             rules: vec![],
             dns: DnsConfig::default(),
+            default_action: Action::Direct,
         }
+    }
+}
+
+/// Configuration profile: a named, switchable set of settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub name: String,
+    pub config: Config,
+}
+
+impl Profile {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let profile: Profile = serde_yaml::from_str(&content)?;
+        Ok(profile)
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let yaml = serde_yaml::to_string(self)?;
+        std::fs::write(path, yaml)?;
+        Ok(())
     }
 }

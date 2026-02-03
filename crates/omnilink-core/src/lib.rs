@@ -1,3 +1,4 @@
+pub mod checker;
 pub mod config;
 pub mod dns;
 pub mod proxy;
