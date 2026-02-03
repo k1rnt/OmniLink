@@ -1,0 +1,14 @@
+[package]
+name = "omnilink-ebpf-common"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+user = ["aya"]
+
+[dependencies]
+aya = { version = "0.13", optional = true }
+
+[lib]
+# Compiles for both the host (user feature) and BPF target (no features)

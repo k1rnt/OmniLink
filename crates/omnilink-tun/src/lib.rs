@@ -29,7 +29,14 @@ pub fn create_interceptor(
     virtual_dns: std::sync::Arc<omnilink_core::dns::VirtualDns>,
     excluded_ips: Vec<std::net::Ipv4Addr>,
 ) -> Box<dyn interceptor::Interceptor> {
-    Box::new(linux::interceptor::LinuxInterceptor::new(virtual_dns, excluded_ips))
+    #[cfg(feature = "ebpf")]
+    {
+        Box::new(linux::ebpf_interceptor::EbpfInterceptor::new(virtual_dns, excluded_ips))
+    }
+    #[cfg(not(feature = "ebpf"))]
+    {
+        Box::new(linux::interceptor::LinuxInterceptor::new(virtual_dns, excluded_ips))
+    }
 }
 
 #[cfg(target_os = "windows")]
