@@ -2,6 +2,7 @@
 DRAFT.md
 
 .DS_Store
+.claude/
 
 # Rust
 /target
