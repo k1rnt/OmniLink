@@ -4,6 +4,7 @@ members = [
     "crates/omnilink-core",
     "crates/omnilink-tun",
     "crates/omnilink-cli",
+    "omnilink-ui/src-tauri",
 ]
 
 [workspace.package]
