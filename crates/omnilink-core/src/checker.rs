@@ -30,6 +30,7 @@ pub async fn check_proxy(server: &ProxyServer, timeout: Duration) -> CheckResult
                 }
                 ProxyProtocol::Socks5 => verify_socks5(server, timeout).await,
                 ProxyProtocol::Http | ProxyProtocol::Https => Ok(()),
+                ProxyProtocol::SshTunnel => Ok(()), // TCP connectivity is sufficient for SSH
             };
 
             match verified {

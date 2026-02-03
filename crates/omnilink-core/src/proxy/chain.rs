@@ -202,6 +202,7 @@ pub async fn connect_single(
         ProxyProtocol::Socks4a => super::socks4::connect_4a(server, dest).await,
         ProxyProtocol::Socks5 => super::socks5::connect(server, dest).await,
         ProxyProtocol::Http | ProxyProtocol::Https => super::http::connect(server, dest).await,
+        ProxyProtocol::SshTunnel => super::ssh::connect(server, dest).await,
     }
 }
 
@@ -216,11 +217,13 @@ async fn tunnel_through(
 
     match server.protocol {
         ProxyProtocol::Socks4 | ProxyProtocol::Socks4a => {
-            // SOCKS4/4a cannot be used as intermediate tunnel proxies
-            // because they don't support tunneling over existing connections.
-            // Fall back to a fresh connection for these protocols.
             return Err(ProxyError::ProtocolError(
                 "SOCKS4/4a cannot be used as intermediate proxy in strict chains".to_string(),
+            ));
+        }
+        ProxyProtocol::SshTunnel => {
+            return Err(ProxyError::ProtocolError(
+                "SSH tunnel cannot be used as intermediate proxy in strict chains".to_string(),
             ));
         }
         ProxyProtocol::Socks5 => {

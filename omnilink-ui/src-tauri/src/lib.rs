@@ -403,6 +403,7 @@ async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Resul
         "socks5" => omnilink_core::proxy::ProxyProtocol::Socks5,
         "http" => omnilink_core::proxy::ProxyProtocol::Http,
         "https" => omnilink_core::proxy::ProxyProtocol::Https,
+        "ssh" | "ssh_tunnel" => omnilink_core::proxy::ProxyProtocol::SshTunnel,
         _ => return Err(format!("Unknown protocol: {}", req.protocol)),
     };
 

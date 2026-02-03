@@ -2,6 +2,7 @@ pub mod chain;
 pub mod http;
 pub mod socks4;
 pub mod socks5;
+pub mod ssh;
 
 use std::net::SocketAddr;
 use thiserror::Error;
@@ -29,6 +30,7 @@ pub enum ProxyProtocol {
     Socks5,
     Http,
     Https,
+    SshTunnel,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

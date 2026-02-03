@@ -158,6 +158,7 @@ function ProxiesView() {
                 <option value="socks4a">SOCKS4a</option>
                 <option value="http">HTTP</option>
                 <option value="https">HTTPS</option>
+                <option value="ssh_tunnel">SSH Tunnel</option>
               </select>
             </div>
             <div style={{ display: "flex", gap: 8 }}>
