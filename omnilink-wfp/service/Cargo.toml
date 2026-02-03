@@ -1,0 +1,17 @@
+[package]
+name = "omnilink-wfp-service"
+version = "0.1.0"
+edition = "2021"
+description = "User-mode service for OmniLink WFP callout driver communication"
+
+# This crate is Windows-only and not part of the workspace.
+# Build with: cargo build -p omnilink-wfp-service --target x86_64-pc-windows-msvc
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+anyhow = "1"

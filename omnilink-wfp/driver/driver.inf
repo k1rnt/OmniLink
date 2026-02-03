@@ -1,0 +1,45 @@
+;
+; OmniLink WFP Callout Driver INF
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = WFPCALLOUTS
+ClassGuid   = {57465043-616C-6C6F-7574-5F636C617373}
+Provider    = %ProviderString%
+CatalogFile = omnilink-wfp.cat
+DriverVer   = 01/01/2026,0.1.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 13
+OmniLinkWFP.DriverFiles = 13
+
+[DefaultInstall.NT$ARCH$]
+CopyFiles = OmniLinkWFP.DriverFiles
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService = OmniLinkWFP,,OmniLinkWFP.Service
+
+[DefaultUninstall.NT$ARCH$]
+DelFiles  = OmniLinkWFP.DriverFiles
+LegacyUninstall = 1
+
+[DefaultUninstall.NT$ARCH$.Services]
+DelService = OmniLinkWFP,0x200
+
+[OmniLinkWFP.DriverFiles]
+omnilink-wfp.sys,,,0x00000040
+
+[OmniLinkWFP.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceBinary  = %13%\omnilink-wfp.sys
+ServiceType    = 1    ; SERVICE_KERNEL_DRIVER
+StartType      = 3    ; SERVICE_DEMAND_START
+ErrorControl   = 1    ; SERVICE_ERROR_NORMAL
+
+[Strings]
+ProviderString     = "OmniLink"
+ServiceName        = "OmniLink WFP Callout Driver"
+ServiceDescription = "Transparent traffic interception via Windows Filtering Platform"
