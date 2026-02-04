@@ -59,7 +59,7 @@ jobs:
 
       - name: Build eBPF program
         run: |
-          cargo +nightly build \
+          cargo +nightly build --release \
             --manifest-path crates/omnilink-ebpf/Cargo.toml \
             --target bpfel-unknown-none \
             -Z build-std=core
