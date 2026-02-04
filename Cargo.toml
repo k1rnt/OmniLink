@@ -7,6 +7,10 @@ members = [
     "crates/omnilink-ebpf-common",
     "omnilink-ui/src-tauri",
 ]
+exclude = [
+    "crates/omnilink-ebpf",
+    "omnilink-wfp/service",
+]
 # Note: crates/omnilink-ebpf is NOT a workspace member.
 # It targets bpfel-unknown-none and must be built separately:
 #   cargo +nightly build -p omnilink-ebpf --target bpfel-unknown-none -Z build-std=core
