@@ -5,6 +5,7 @@ use aya_ebpf::{
     macros::{cgroup_sock_addr, map, sock_ops},
     maps::{Array, HashMap},
     programs::{SockAddrContext, SockOpsContext},
+    EbpfContext,
 };
 use omnilink_ebpf_common::{InterceptConfig, OriginalDest, PortKey, SockKey};
 

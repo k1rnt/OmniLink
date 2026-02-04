@@ -16,7 +16,7 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 const FILE_DEVICE_NETWORK: u32 = 0x00000012;
 
-fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
+const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
     (device_type << 16) | (access << 14) | (function << 2) | method
 }
 
