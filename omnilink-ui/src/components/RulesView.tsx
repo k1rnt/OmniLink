@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { ApplicationInfo } from "../types";
 
 interface RuleInfo {
   index: number;
@@ -32,6 +33,9 @@ function RulesView() {
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<AddRuleForm>(emptyForm);
+  const [showAppSelector, setShowAppSelector] = useState(false);
+  const [apps, setApps] = useState<ApplicationInfo[]>([]);
+  const [appSearchQuery, setAppSearchQuery] = useState("");
 
   const fetchRules = useCallback(async () => {
     try {
@@ -92,13 +96,56 @@ function RulesView() {
     }
   };
 
+  const handleExport = async () => {
+    try {
+      const yaml = await invoke<string>("export_rules_yaml");
+      await navigator.clipboard.writeText(yaml);
+      alert("Rules exported to clipboard as YAML");
+    } catch (e) {
+      console.error("Failed to export rules:", e);
+      alert(`Export failed: ${e}`);
+    }
+  };
+
+  const openAppSelector = async () => {
+    try {
+      const result = await invoke<ApplicationInfo[]>("list_installed_apps");
+      setApps(result);
+      setShowAppSelector(true);
+      setAppSearchQuery("");
+    } catch (e) {
+      console.error("Failed to load apps:", e);
+    }
+  };
+
+  const selectApp = (app: ApplicationInfo) => {
+    setForm({
+      ...form,
+      conditionType: "process_name",
+      conditionValue: app.executable_name,
+      name: form.name || `Rule: ${app.name}`,
+    });
+    setShowAppSelector(false);
+  };
+
+  const filteredApps = apps.filter(
+    (app) =>
+      app.name.toLowerCase().includes(appSearchQuery.toLowerCase()) ||
+      app.executable_name.toLowerCase().includes(appSearchQuery.toLowerCase())
+  );
+
   return (
     <div className="rules-panel">
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
         <h3 style={{ fontSize: 16, fontWeight: 600 }}>Routing Rules</h3>
-        <button className="btn btn-primary" onClick={() => setShowForm(!showForm)}>
-          {showForm ? "Cancel" : "Add Rule"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn" onClick={handleExport}>
+            Export YAML
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowForm(!showForm)}>
+            {showForm ? "Cancel" : "Add Rule"}
+          </button>
+        </div>
       </div>
 
       {showForm && (
@@ -140,6 +187,11 @@ function RulesView() {
                 onChange={(e) => setForm({ ...form, conditionValue: e.target.value })}
                 style={{ flex: 1 }}
               />
+              {form.conditionType === "process_name" && (
+                <button className="btn" onClick={openAppSelector} style={{ whiteSpace: "nowrap" }}>
+                  Select App
+                </button>
+              )}
             </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <select
@@ -219,6 +271,60 @@ function RulesView() {
             </div>
           </div>
         ))
+      )}
+
+      {/* App Selector Modal */}
+      {showAppSelector && (
+        <div className="modal-overlay" onClick={() => setShowAppSelector(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxHeight: "70vh", display: "flex", flexDirection: "column" }}>
+            <h3>Select Application</h3>
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search apps..."
+              value={appSearchQuery}
+              onChange={(e) => setAppSearchQuery(e.target.value)}
+              style={{ marginBottom: 12, width: "100%" }}
+            />
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+              {filteredApps.map((app) => (
+                <div
+                  key={app.executable_path}
+                  className="app-selector-item"
+                  onClick={() => selectApp(app)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 12,
+                    padding: "8px 12px",
+                    background: "var(--bg-primary)",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ width: 32, height: 32, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    {app.icon_base64 ? (
+                      <img src={`data:image/png;base64,${app.icon_base64}`} alt="" style={{ width: 32, height: 32 }} />
+                    ) : (
+                      <div style={{ width: 32, height: 32, background: "var(--bg-tertiary)", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>
+                        {app.name.charAt(0)}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{app.name}</div>
+                    <div style={{ fontSize: 11, color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{app.executable_name}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-actions" style={{ marginTop: 12 }}>
+              <button className="btn" onClick={() => setShowAppSelector(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

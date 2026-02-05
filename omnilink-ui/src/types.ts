@@ -44,3 +44,12 @@ export interface AppState {
   active_connections: number;
   dns_mode: string;
 }
+
+export interface ApplicationInfo {
+  name: string;
+  bundle_id: string | null;
+  executable_name: string;
+  executable_path: string;
+  icon_base64: string | null;
+  version: string | null;
+}
