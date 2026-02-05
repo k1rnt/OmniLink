@@ -34,6 +34,7 @@ OmniLink intercepts network traffic at the OS level and routes it through proxy 
 - **Connection Control** - Terminate active connections from the UI
 - **Apps Browser** - View installed applications and use app selector for easy process-based rule creation
 - **YAML Export** - Export rules to YAML format
+- **Self-Update** - Built-in automatic update from GitHub Releases
 
 ## Architecture
 
