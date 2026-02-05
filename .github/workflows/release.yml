@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        run: |
+          cd omnilink-ui
+          npm ci
+
+      - name: Build Tauri app
+        run: |
+          cd omnilink-ui
+          npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniLink-${{ matrix.target }}
+          path: |
+            omnilink-ui/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            omnilink-ui/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+
+  create-universal:
+    needs: build-macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OmniLink-aarch64-apple-darwin
+          path: arm64
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OmniLink-x86_64-apple-darwin
+          path: x86_64
+
+      - name: Create Universal Binary
+        run: |
+          mkdir -p universal
+
+          # Find and copy the arm64 app
+          ARM64_APP=$(find arm64 -name "*.app" -type d | head -1)
+          cp -R "$ARM64_APP" universal/OmniLink.app
+
+          # Find the executables (binary name is omnilink-tauri)
+          ARM64_BIN=$(find arm64 -path "*/MacOS/omnilink-tauri" -type f | head -1)
+          X86_BIN=$(find x86_64 -path "*/MacOS/omnilink-tauri" -type f | head -1)
+
+          # Create universal binary using lipo
+          lipo -create "$ARM64_BIN" "$X86_BIN" -output universal/OmniLink.app/Contents/MacOS/omnilink-tauri
+
+          # Verify
+          file universal/OmniLink.app/Contents/MacOS/omnilink-tauri
+
+      - name: Create Universal DMG
+        run: |
+          # Create DMG
+          hdiutil create -volname "OmniLink" \
+            -srcfolder universal/OmniLink.app \
+            -ov -format UDZO \
+            OmniLink-${{ github.ref_name }}-universal.dmg
+
+      - name: Upload Universal DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniLink-universal
+          path: OmniLink-${{ github.ref_name }}-universal.dmg
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        run: |
+          cd omnilink-ui
+          npm ci
+
+      - name: Build Tauri app
+        run: |
+          cd omnilink-ui
+          npm run tauri build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniLink-linux
+          path: |
+            omnilink-ui/src-tauri/target/release/bundle/deb/*.deb
+            omnilink-ui/src-tauri/target/release/bundle/appimage/*.AppImage
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        run: |
+          cd omnilink-ui
+          npm ci
+
+      - name: Build Tauri app
+        run: |
+          cd omnilink-ui
+          npm run tauri build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniLink-windows
+          path: |
+            omnilink-ui/src-tauri/target/release/bundle/msi/*.msi
+            omnilink-ui/src-tauri/target/release/bundle/nsis/*.exe
+
+  release:
+    needs: [create-universal, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -R artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/OmniLink-universal/*.dmg
+            artifacts/OmniLink-aarch64-apple-darwin/**/*.dmg
+            artifacts/OmniLink-x86_64-apple-darwin/**/*.dmg
+            artifacts/OmniLink-linux/**/*.deb
+            artifacts/OmniLink-linux/**/*.AppImage
+            artifacts/OmniLink-windows/**/*.msi
+            artifacts/OmniLink-windows/**/*.exe
+          draft: true
+          generate_release_notes: true
