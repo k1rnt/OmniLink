@@ -8,6 +8,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use omnilink_core::config::Config;
+use omnilink_core::credential::CredentialManager;
 use omnilink_tun::interceptor::InterceptorEvent;
 
 #[derive(Parser)]
@@ -43,6 +44,38 @@ enum Commands {
     },
     /// Start transparent traffic interception (requires root/admin)
     Intercept,
+    /// Manage proxy credentials in OS keychain
+    Credential {
+        #[command(subcommand)]
+        action: CredentialAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialAction {
+    /// Store credentials for a proxy in OS keychain
+    Set {
+        /// Proxy name
+        proxy: String,
+        /// Username
+        #[arg(short, long)]
+        username: String,
+        /// Password
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Delete credentials for a proxy from OS keychain
+    Delete {
+        /// Proxy name
+        proxy: String,
+    },
+    /// Check if credentials exist for a proxy
+    Check {
+        /// Proxy name
+        proxy: String,
+    },
+    /// Migrate plaintext credentials from config to OS keychain
+    Migrate,
 }
 
 #[tokio::main]
@@ -80,6 +113,7 @@ async fn main() -> Result<()> {
             cmd_check_proxies(&cli.config, timeout).await
         }
         Commands::Intercept => cmd_intercept(&cli.config).await,
+        Commands::Credential { action } => cmd_credential(&cli.config, action),
     }
 }
 
@@ -565,4 +599,53 @@ async fn cmd_check_proxies(config_path: &PathBuf, timeout_secs: u64) -> Result<(
     );
 
     Ok(())
+}
+
+fn cmd_credential(config_path: &PathBuf, action: CredentialAction) -> Result<()> {
+    match action {
+        CredentialAction::Set {
+            proxy,
+            username,
+            password,
+        } => {
+            CredentialManager::store(&proxy, &username, &password)?;
+            println!("Credentials stored for proxy '{}'", proxy);
+            println!("Note: Set 'has_auth: true' for this proxy in your config file.");
+            Ok(())
+        }
+        CredentialAction::Delete { proxy } => {
+            CredentialManager::delete(&proxy)?;
+            println!("Credentials deleted for proxy '{}'", proxy);
+            Ok(())
+        }
+        CredentialAction::Check { proxy } => {
+            if CredentialManager::exists(&proxy) {
+                println!("Credentials exist for proxy '{}'", proxy);
+            } else {
+                println!("No credentials found for proxy '{}'", proxy);
+            }
+            Ok(())
+        }
+        CredentialAction::Migrate => {
+            let mut config = Config::load(config_path)?;
+
+            if !config.needs_credential_migration() {
+                println!("No plaintext credentials found in config. Nothing to migrate.");
+                return Ok(());
+            }
+
+            let migrated = config.migrate_credentials()?;
+            println!("Migrated credentials for {} proxy(ies):", migrated.len());
+            for name in &migrated {
+                println!("  - {}", name);
+            }
+
+            // Save updated config
+            let yaml = serde_yaml::to_string(&config)?;
+            std::fs::write(config_path, yaml)?;
+            println!("\nConfig file updated. Plaintext credentials have been removed.");
+
+            Ok(())
+        }
+    }
 }

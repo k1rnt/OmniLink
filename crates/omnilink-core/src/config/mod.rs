@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::credential::{CredentialError, CredentialManager};
 use crate::dns::DnsMode;
 use crate::proxy::{ProxyAuth, ProxyProtocol, ProxyServer};
 use crate::rule::{Action, Rule};
@@ -77,18 +78,39 @@ pub struct ProxyServerConfig {
     pub protocol: ProxyProtocol,
     pub address: String,
     pub port: u16,
-    #[serde(default)]
+    /// Legacy field for backward compatibility. Use `has_auth` instead.
+    /// When present, credentials will be migrated to OS keychain on load.
+    #[serde(default, skip_serializing)]
     pub auth: Option<ProxyAuth>,
+    /// If true, credentials are stored in OS keychain under the proxy name.
+    #[serde(default)]
+    pub has_auth: bool,
 }
 
 impl ProxyServerConfig {
+    /// Convert to ProxyServer, retrieving credentials from keychain if needed.
     pub fn to_proxy_server(&self) -> anyhow::Result<ProxyServer> {
         let addr = format!("{}:{}", self.address, self.port).parse()?;
+
+        // Try to get auth from keychain if has_auth is set
+        let auth = if self.has_auth {
+            match CredentialManager::retrieve(&self.name) {
+                Ok((username, password)) => Some(ProxyAuth { username, password }),
+                Err(e) => {
+                    tracing::warn!(proxy = %self.name, error = %e, "failed to retrieve credentials from keychain");
+                    None
+                }
+            }
+        } else {
+            // Fallback to legacy auth field (for backward compatibility during migration)
+            self.auth.clone()
+        };
+
         Ok(ProxyServer {
             name: self.name.clone(),
             protocol: self.protocol.clone(),
             addr,
-            auth: self.auth.clone(),
+            auth,
         })
     }
 }
@@ -159,6 +181,29 @@ impl Config {
             dns: DnsConfig::default(),
             default_action: Action::Direct,
         }
+    }
+
+    /// Migrate legacy plaintext credentials to OS keychain.
+    ///
+    /// Returns the list of proxy names that were migrated.
+    /// After migration, call `save()` to persist the updated config.
+    pub fn migrate_credentials(&mut self) -> Result<Vec<String>, CredentialError> {
+        let mut migrated = Vec::new();
+
+        for proxy in &mut self.proxies {
+            if let Some(auth) = proxy.auth.take() {
+                CredentialManager::store(&proxy.name, &auth.username, &auth.password)?;
+                proxy.has_auth = true;
+                migrated.push(proxy.name.clone());
+            }
+        }
+
+        Ok(migrated)
+    }
+
+    /// Check if any proxies have legacy plaintext credentials that need migration.
+    pub fn needs_credential_migration(&self) -> bool {
+        self.proxies.iter().any(|p| p.auth.is_some())
     }
 }
 

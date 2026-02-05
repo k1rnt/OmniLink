@@ -1,5 +1,6 @@
 pub mod checker;
 pub mod config;
+pub mod credential;
 pub mod dns;
 pub mod proxy;
 pub mod rule;

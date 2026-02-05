@@ -15,3 +15,4 @@ ipnet = { workspace = true }
 regex = { workspace = true }
 russh = "0.46"
 async-trait = "0.1"
+keyring = "3"

@@ -419,14 +419,14 @@ async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Resul
         _ => return Err(format!("Unknown protocol: {}", req.protocol)),
     };
 
-    let auth = match (req.username, req.password) {
+    // Store credentials in OS keychain if provided
+    let has_auth = match (req.username, req.password) {
         (Some(u), Some(p)) if !u.is_empty() => {
-            Some(omnilink_core::proxy::ProxyAuth {
-                username: u,
-                password: p,
-            })
+            omnilink_core::credential::CredentialManager::store(&req.name, &u, &p)
+                .map_err(|e| e.to_string())?;
+            true
         }
-        _ => None,
+        _ => false,
     };
 
     config.proxies.push(ProxyServerConfig {
@@ -434,7 +434,8 @@ async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Resul
         protocol,
         address: req.address,
         port: req.port,
-        auth,
+        auth: None, // No longer stored in config
+        has_auth,
     });
 
     Ok(format!("Proxy '{}' added", req.name))
@@ -444,6 +445,16 @@ async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Resul
 async fn delete_proxy(state: State<'_, SharedState>, name: String) -> Result<String, String> {
     let mut state = state.lock().await;
     let config = state.config.as_mut().ok_or("No configuration loaded")?;
+
+    // Find and check if proxy has credentials
+    let proxy = config.proxies.iter().find(|p| p.name == name);
+    if let Some(p) = proxy {
+        if p.has_auth {
+            // Delete credentials from keychain (ignore errors)
+            let _ = omnilink_core::credential::CredentialManager::delete(&name);
+        }
+    }
+
     let before = config.proxies.len();
     config.proxies.retain(|p| p.name != name);
     if config.proxies.len() == before {
@@ -816,6 +827,40 @@ async fn get_interceptor_status(state: State<'_, SharedState>) -> Result<bool, S
     Ok(state.interceptor_running)
 }
 
+// --- Credential Management ---
+
+#[tauri::command]
+async fn set_proxy_credentials(
+    proxy_name: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    omnilink_core::credential::CredentialManager::store(&proxy_name, &username, &password)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_proxy_credentials(proxy_name: String) -> Result<(), String> {
+    omnilink_core::credential::CredentialManager::delete(&proxy_name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn has_proxy_credentials(proxy_name: String) -> Result<bool, String> {
+    Ok(omnilink_core::credential::CredentialManager::exists(&proxy_name))
+}
+
+#[tauri::command]
+async fn migrate_credentials(state: State<'_, SharedState>) -> Result<Vec<String>, String> {
+    let mut state_guard = state.lock().await;
+    let config = state_guard
+        .config
+        .as_mut()
+        .ok_or("No configuration loaded")?;
+
+    config.migrate_credentials().map_err(|e| e.to_string())
+}
+
 async fn run_service(
     listen_addr: &str,
     rule_engine: Arc<RuleEngine>,
@@ -1135,6 +1180,10 @@ pub fn run() {
             start_interceptor,
             stop_interceptor,
             get_interceptor_status,
+            set_proxy_credentials,
+            delete_proxy_credentials,
+            has_proxy_credentials,
+            migrate_credentials,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

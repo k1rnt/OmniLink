@@ -8,9 +8,9 @@ proxies:
     protocol: !Socks5
     address: "proxy.example.com"
     port: 1080
-    auth:
-      username: user
-      password: pass
+    # Credentials are stored in OS keychain. Set with:
+    #   omnilink credential set my-socks5 -u user -p pass
+    has_auth: true
 
   - name: my-http
     protocol: !Http
