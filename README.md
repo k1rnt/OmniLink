@@ -2,36 +2,49 @@
 
 A cross-platform transparent proxy client built with Rust and Tauri.
 
-OmniLink intercepts network traffic at the OS level and routes it through SOCKS5 or HTTP proxy servers based on user-defined rules. It supports Windows, macOS, and Linux with platform-native interception mechanisms.
+OmniLink intercepts network traffic at the OS level and routes it through proxy servers based on user-defined rules. It supports Windows, macOS, and Linux with platform-native interception mechanisms.
 
 ## Features
 
-- **SOCKS5 / HTTP(S) Proxy** - Full SOCKS5 client (no-auth and username/password), HTTP CONNECT tunnel support
-- **Rule-Based Routing** - Route traffic based on process name, destination domain/IP (CIDR), port, or user. Supports glob patterns, wildcards, and semicolon-separated multi-match
-- **Virtual DNS (Fake IP)** - Prevents DNS leaks by mapping domains to a private IP pool (`198.18.0.0/15`) and resolving through the proxy
+### Proxy Protocols
+- **SOCKS4 / SOCKS4a** - Legacy SOCKS protocol support
+- **SOCKS5** - Full support including no-auth, username/password authentication, and UDP Associate
+- **HTTP / HTTPS CONNECT** - HTTP tunnel proxy support
+- **SSH Tunnel** - Direct-tcpip channel forwarding via russh
+
+### Routing & Rules
+- **Rule-Based Routing** - Route traffic based on process name, destination domain/IP (CIDR), port range, or user
 - **Proxy Chains** - Chain multiple proxies with strict, failover, round-robin, or random selection modes
-- **Proxy Checker** - Built-in latency and connectivity checker for configured proxy servers
+- **Virtual DNS (Fake IP)** - Prevents DNS leaks by mapping domains to a private IP pool (`198.18.0.0/15`)
+
+### Management
+- **Proxy Checker** - Built-in latency and connectivity checker
 - **Profile System** - Save and switch between named configuration profiles
 - **Connection Monitor** - Real-time connection list with filtering, search, and traffic statistics
-- **Cross-Platform UI** - Tauri + React desktop application with dark theme
-- **TUN Device** - Transparent interception via virtual network interface on Linux
-- **Lightweight** - Rust core targeting < 50MB memory and < 2ms added latency
+- **Traffic Visualization** - Real-time bandwidth graph with per-proxy and per-domain statistics
+- **Secure Credential Storage** - OS keychain integration (macOS Keychain, Windows Credential Manager, Linux Secret Service)
+- **System Proxy** - Automatic system-wide proxy configuration
+
+### Desktop Application
+- **Cross-Platform UI** - Tauri + React desktop application
+- **Full CRUD Operations** - Create, edit, delete rules, proxies, and chains from the UI
+- **Connection Control** - Terminate active connections from the UI
 
 ## Architecture
 
 ```
-┌──────────────────────────────────┐
-│     UI Layer (Tauri + React)     │
-├──────────────────────────────────┤
-│    Core Engine (Rust / Tokio)    │
-│  ┌────────┐ ┌──────┐ ┌───────┐  │
-│  │ Proxy  │ │ Rule │ │  DNS  │  │
-│  │ Client │ │Engine│ │Resolver│  │
-│  └────────┘ └──────┘ └───────┘  │
-├──────────────────────────────────┤
-│     OS Interceptor (Native)      │
-│  Win: WFP  macOS: NE  Linux: TUN│
-└──────────────────────────────────┘
++----------------------------------+
+|     UI Layer (Tauri + React)     |
++----------------------------------+
+|    Core Engine (Rust / Tokio)    |
+|  +--------+ +------+ +--------+  |
+|  | Proxy  | | Rule | |  DNS   |  |
+|  | Client | |Engine| |Resolver|  |
+|  +--------+ +------+ +--------+  |
++----------------------------------+
+|     OS Interceptor (Native)      |
+|  Win: WFP  macOS: NE  Linux: eBPF|
++----------------------------------+
 ```
 
 ## Project Structure
@@ -41,17 +54,21 @@ OmniLink/
 ├── crates/
 │   ├── omnilink-core/       # Core proxy engine
 │   │   └── src/
-│   │       ├── proxy/       # SOCKS5, HTTP proxy clients
+│   │       ├── proxy/       # SOCKS4/5, HTTP, SSH proxy clients
 │   │       ├── rule/        # Rule matching engine
 │   │       ├── dns/         # Virtual DNS / Fake IP
 │   │       ├── config/      # Configuration and profiles
+│   │       ├── credential/  # OS keychain integration
 │   │       ├── checker.rs   # Proxy latency checker
 │   │       └── session.rs   # Connection session tracking
 │   ├── omnilink-tun/        # TUN device + packet parsing
+│   ├── omnilink-ebpf/       # Linux eBPF interceptor
 │   └── omnilink-cli/        # CLI binary
 ├── omnilink-ui/             # Tauri + React frontend
 │   ├── src/                 # React components
 │   └── src-tauri/           # Tauri Rust backend
+├── omnilink-ne/             # macOS Network Extension
+├── omnilink-wfp/            # Windows WFP driver + service
 ├── config.example.yaml      # Example configuration
 └── Cargo.toml               # Workspace root
 ```
@@ -62,7 +79,7 @@ OmniLink/
 
 - Rust 1.75+
 - Node.js 18+
-- Platform-specific: Xcode (macOS), GTK3 (Linux)
+- Platform-specific: Xcode (macOS), GTK3/WebKit (Linux)
 
 ### Build
 
@@ -83,7 +100,7 @@ cargo run --bin omnilink-cli -- check-proxies -c config.yaml
 cargo run --bin omnilink-cli -- run -c config.yaml
 ```
 
-### Build the UI
+### Build the Desktop App
 
 ```sh
 cd omnilink-ui
@@ -111,6 +128,14 @@ proxies:
     protocol: !Http
     address: "httpproxy.example.com"
     port: 8080
+
+  - name: my-ssh
+    protocol: !Ssh
+    address: "ssh.example.com"
+    port: 22
+    auth:
+      username: user
+      private_key_path: ~/.ssh/id_rsa
 ```
 
 ### Proxy Chains
@@ -190,15 +215,26 @@ dns:
 | `omnilink validate` | Validate configuration file |
 | `omnilink init` | Generate default config file |
 | `omnilink check-proxies` | Test proxy server connectivity and latency |
+| `omnilink credential` | Manage credentials in OS keychain |
 
-## Supported Platforms
+## Platform Support
 
 | Platform | Interception Method | Status |
-|----------|-------------------|--------|
-| Linux | TUN device (`omni0`) | Core implemented |
-| macOS | Network Extension | Planned |
-| Windows | WFP (Windows Filtering Platform) | Planned |
+|----------|---------------------|--------|
+| macOS | Network Extension (NETransparentProxyProvider) | Implemented |
+| Linux | eBPF (connect4/sendmsg4 hooks) | Implemented |
+| Windows | WFP (Windows Filtering Platform) | Implemented |
 
-## License
+### Platform-Specific Notes
 
-MIT
+**macOS:**
+- Requires System Extension approval in System Preferences
+- Network Extension requires app notarization for distribution (or Gatekeeper bypass for local builds)
+
+**Linux:**
+- eBPF requires kernel 5.8+ with BPF enabled
+- CAP_BPF or root privileges required
+
+**Windows:**
+- WFP driver requires kernel-mode code signing for production
+- Test signing mode available for development
