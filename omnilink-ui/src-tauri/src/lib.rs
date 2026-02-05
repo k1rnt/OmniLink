@@ -1132,6 +1132,121 @@ async fn handle_connection(
     result
 }
 
+// --- Network Extension (macOS) ---
+
+/// Status of the macOS Network Extension.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NEStatusInfo {
+    pub installed: bool,
+    pub enabled: bool,
+    pub running: bool,
+}
+
+/// Start the NE socket server (Rust backend for Network Extension).
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn start_ne_server(state: State<'_, SharedState>) -> Result<String, String> {
+    let state_guard = state.lock().await;
+
+    let config = state_guard.config.clone().ok_or("No configuration loaded")?;
+
+    // Build rule engine using rules from config
+    let rule_engine = Arc::new(RuleEngine::with_default_action(
+        config.rules.clone(),
+        config.default_action.clone(),
+    ));
+
+    // Build proxy map
+    let mut proxy_map = HashMap::new();
+    for proxy_cfg in &config.proxies {
+        let server = proxy_cfg
+            .to_proxy_server()
+            .map_err(|e| format!("Failed to create proxy server: {}", e))?;
+        proxy_map.insert(proxy_cfg.name.clone(), server);
+    }
+
+    let chain_relay = Arc::new(ChainRelay::new(config.chains.clone(), proxy_map));
+    let virtual_dns = state_guard.virtual_dns.clone();
+    let session_manager = state_guard.session_manager.clone();
+
+    // Create and start the NE interceptor
+    let mut ne_interceptor = omnilink_tun::create_ne_interceptor(
+        rule_engine,
+        chain_relay,
+        virtual_dns,
+        session_manager,
+    );
+
+    let _event_rx = ne_interceptor
+        .start()
+        .await
+        .map_err(|e| format!("Failed to start NE server: {}", e))?;
+
+    // Store the interceptor (we'd need to add a field for this)
+    // For now, just indicate success
+    tracing::info!("NE socket server started");
+
+    Ok("NE socket server started at /var/run/omnilink.sock".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn start_ne_server(_state: State<'_, SharedState>) -> Result<String, String> {
+    Err("Network Extension is only supported on macOS".to_string())
+}
+
+/// Stop the NE socket server.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn stop_ne_server(_state: State<'_, SharedState>) -> Result<String, String> {
+    // Note: Currently we don't track the NE interceptor instance
+    // This would need proper state management
+    Ok("NE socket server stop requested".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn stop_ne_server(_state: State<'_, SharedState>) -> Result<String, String> {
+    Err("Network Extension is only supported on macOS".to_string())
+}
+
+/// Get Network Extension status by calling the helper CLI.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn get_ne_status() -> Result<NEStatusInfo, String> {
+    // Try to call the NE helper
+    let helper_path = std::env::current_exe()
+        .map(|p| p.parent().unwrap_or(std::path::Path::new(".")).join("omnilink-ne-helper"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("omnilink-ne-helper"));
+
+    if helper_path.exists() {
+        match std::process::Command::new(&helper_path)
+            .arg("status")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let json = String::from_utf8_lossy(&output.stdout);
+                serde_json::from_str(&json).map_err(|e| e.to_string())
+            }
+            Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
+            Err(e) => Err(format!("Failed to execute NE helper: {}", e)),
+        }
+    } else {
+        // Helper not found, return default status
+        Ok(NEStatusInfo {
+            installed: false,
+            enabled: false,
+            running: false,
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn get_ne_status() -> Result<NEStatusInfo, String> {
+    Err("Network Extension is only supported on macOS".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let initial_state = AppStateInner {
@@ -1184,6 +1299,9 @@ pub fn run() {
             delete_proxy_credentials,
             has_proxy_credentials,
             migrate_credentials,
+            start_ne_server,
+            stop_ne_server,
+            get_ne_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

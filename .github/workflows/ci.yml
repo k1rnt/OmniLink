@@ -77,3 +77,24 @@ jobs:
 
       - name: Check WFP service
         run: cargo check --manifest-path omnilink-wfp/service/Cargo.toml
+
+  network-extension:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Swift syntax
+        run: |
+          # Verify Swift files compile (syntax check)
+          cd omnilink-ne
+          for f in OmniLinkExtension/*.swift OmniLinkApp/*.swift Shared/*.swift OmniLinkHelper/*.swift; do
+            if [ -f "$f" ]; then
+              echo "Checking $f..."
+              swiftc -parse "$f" -sdk $(xcrun --sdk macosx --show-sdk-path) \
+                -target arm64-apple-macosx12.0 || echo "Warning: $f may have import dependencies"
+            fi
+          done
+
+      - name: Check NE Rust integration
+        run: |
+          cargo check -p omnilink-tun

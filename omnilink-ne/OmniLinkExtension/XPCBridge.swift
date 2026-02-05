@@ -1,37 +1,41 @@
 import Foundation
 import os.log
 
-/// Manages the XPC / Unix socket connection from the NE extension to the main app.
+/// Manages the Unix socket connection from the NE extension to the Rust backend.
 ///
-/// Currently uses Unix domain socket for communication with the Rust backend,
-/// as Rust XPC bindings are not mature enough for production use.
-/// Can be switched to XPC (NSXPCConnection) in the future.
+/// Uses length-prefixed JSON framing for wire protocol:
+/// +----------------+-------------------+
+/// | length (4 BE)  | JSON payload      |
+/// +----------------+-------------------+
 class XPCBridge {
 
     private let log = OSLog(subsystem: "com.omnilink.ne-extension", category: "xpc")
-    private var connection: NSXPCConnection?
     private var socketFd: Int32 = -1
+    private let socketQueue = DispatchQueue(label: "com.omnilink.xpc.socket", qos: .userInitiated)
+    private let lock = NSLock()
 
     // MARK: - Connection Management
 
     func connect() {
-        // Option 1: Unix domain socket (recommended for Rust interop)
         connectViaSocket()
-
-        // Option 2: XPC (uncomment when Rust XPC support is ready)
-        // connectViaXPC()
     }
 
     func disconnect() {
+        lock.lock()
+        defer { lock.unlock() }
+
         if socketFd >= 0 {
-            close(socketFd)
+            Darwin.close(socketFd)
             socketFd = -1
         }
 
-        connection?.invalidate()
-        connection = nil
-
         os_log("XPC bridge disconnected", log: log, type: .info)
+    }
+
+    var isConnected: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return socketFd >= 0
     }
 
     // MARK: - Unix Socket Connection
@@ -70,99 +74,254 @@ class XPCBridge {
         }
     }
 
-    // MARK: - XPC Connection (Future)
+    // MARK: - Wire Protocol
 
-    private func connectViaXPC() {
-        connection = NSXPCConnection(machServiceName: kOmniLinkXPCServiceName,
-                                     options: .privileged)
-        connection?.remoteObjectInterface = NSXPCInterface(with: OmniLinkXPCProtocol.self)
-        connection?.interruptionHandler = { [weak self] in
-            os_log("XPC connection interrupted", log: self?.log ?? .default, type: .error)
-        }
-        connection?.invalidationHandler = { [weak self] in
-            os_log("XPC connection invalidated", log: self?.log ?? .default, type: .error)
-        }
-        connection?.resume()
+    /// Write a length-prefixed JSON frame to the socket.
+    private func writeFrame(_ message: [String: Any]) throws {
+        let jsonData = try JSONSerialization.data(withJSONObject: message, options: [])
 
-        os_log("XPC connection established", log: log, type: .info)
+        // Write 4-byte big-endian length prefix
+        var length = UInt32(jsonData.count).bigEndian
+        let lengthData = Data(bytes: &length, count: 4)
+
+        lock.lock()
+        let fd = socketFd
+        lock.unlock()
+
+        guard fd >= 0 else {
+            throw XPCError.notConnected
+        }
+
+        // Write length prefix
+        try lengthData.withUnsafeBytes { ptr in
+            let written = Darwin.write(fd, ptr.baseAddress!, 4)
+            if written != 4 {
+                throw XPCError.writeError(errno)
+            }
+        }
+
+        // Write JSON payload
+        try jsonData.withUnsafeBytes { ptr in
+            var totalWritten = 0
+            while totalWritten < jsonData.count {
+                let written = Darwin.write(fd, ptr.baseAddress!.advanced(by: totalWritten),
+                                          jsonData.count - totalWritten)
+                if written <= 0 {
+                    throw XPCError.writeError(errno)
+                }
+                totalWritten += written
+            }
+        }
+    }
+
+    /// Read a length-prefixed JSON frame from the socket.
+    private func readFrame() throws -> [String: Any] {
+        lock.lock()
+        let fd = socketFd
+        lock.unlock()
+
+        guard fd >= 0 else {
+            throw XPCError.notConnected
+        }
+
+        // Read 4-byte big-endian length prefix
+        var lengthBytes = [UInt8](repeating: 0, count: 4)
+        var totalRead = 0
+        while totalRead < 4 {
+            let n = Darwin.read(fd, &lengthBytes[totalRead], 4 - totalRead)
+            if n <= 0 {
+                throw XPCError.readError(errno)
+            }
+            totalRead += n
+        }
+
+        let length = UInt32(bigEndian: Data(lengthBytes).withUnsafeBytes { $0.load(as: UInt32.self) })
+
+        guard length > 0 && length < 1024 * 1024 else {
+            throw XPCError.invalidLength(Int(length))
+        }
+
+        // Read JSON payload
+        var payload = [UInt8](repeating: 0, count: Int(length))
+        totalRead = 0
+        while totalRead < Int(length) {
+            let n = Darwin.read(fd, &payload[totalRead], Int(length) - totalRead)
+            if n <= 0 {
+                throw XPCError.readError(errno)
+            }
+            totalRead += n
+        }
+
+        let data = Data(payload)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw XPCError.invalidJSON
+        }
+
+        return json
+    }
+
+    /// Send a request and receive a response synchronously.
+    private func sendRequest(_ request: [String: Any]) -> [String: Any]? {
+        do {
+            try writeFrame(request)
+            return try readFrame()
+        } catch {
+            os_log("Socket communication error: %{public}@", log: log, type: .error, "\(error)")
+            return nil
+        }
     }
 
     // MARK: - Protocol Methods
 
     func getRoutingDecision(sourceApp: String, host: String, port: Int,
                             completion: @escaping (String, String) -> Void) {
-        if socketFd >= 0 {
-            // TODO: Send JSON-encoded request over socket, read response
-            // For now, default to direct
-            completion("direct", "")
-            return
+        socketQueue.async { [weak self] in
+            guard let self = self, self.isConnected else {
+                DispatchQueue.main.async { completion("direct", "") }
+                return
+            }
+
+            let flowId = UUID().uuidString
+            let request: [String: Any] = [
+                "type": "routing",
+                "flow_id": flowId,
+                "app_id": sourceApp,
+                "host": host,
+                "port": port,
+                "protocol": "tcp"
+            ]
+
+            if let response = self.sendRequest(request),
+               let action = response["action"] as? String {
+                let proxyName = response["proxy_name"] as? String ?? ""
+                DispatchQueue.main.async { completion(action, proxyName) }
+            } else {
+                DispatchQueue.main.async { completion("direct", "") }
+            }
         }
-
-        guard let proxy = connection?.remoteObjectProxyWithErrorHandler({ error in
-            os_log("XPC error: %{public}@", type: .error, error.localizedDescription)
-            completion("direct", "")
-        }) as? OmniLinkXPCProtocol else {
-            completion("direct", "")
-            return
-        }
-
-        proxy.getRoutingDecision(
-            sourceAppIdentifier: sourceApp,
-            destinationHost: host,
-            destinationPort: port,
-            reply: completion
-        )
-    }
-
-    func relayData(flowId: String, data: Data, direction: String,
-                   completion: @escaping (Bool) -> Void) {
-        if socketFd >= 0 {
-            // TODO: Send data frame over socket
-            completion(true)
-            return
-        }
-
-        guard let proxy = connection?.remoteObjectProxyWithErrorHandler({ _ in
-            completion(false)
-        }) as? OmniLinkXPCProtocol else {
-            completion(false)
-            return
-        }
-
-        proxy.relayData(flowId: flowId, data: data, direction: direction, reply: completion)
     }
 
     func connectFlow(flowId: String, host: String, port: Int, proxyName: String,
                      completion: @escaping (Bool, String) -> Void) {
-        if socketFd >= 0 {
-            // TODO: Send connect request over socket
-            completion(true, "")
-            return
-        }
+        socketQueue.async { [weak self] in
+            guard let self = self, self.isConnected else {
+                DispatchQueue.main.async { completion(false, "Not connected") }
+                return
+            }
 
-        guard let proxy = connection?.remoteObjectProxyWithErrorHandler({ error in
-            completion(false, error.localizedDescription)
-        }) as? OmniLinkXPCProtocol else {
-            completion(false, "No XPC connection")
-            return
-        }
+            let request: [String: Any] = [
+                "type": "connect",
+                "flow_id": flowId,
+                "host": host,
+                "port": port,
+                "proxy_name": proxyName.isEmpty ? NSNull() : proxyName
+            ]
 
-        proxy.connectFlow(
-            flowId: flowId,
-            destinationHost: host,
-            destinationPort: port,
-            proxyName: proxyName,
-            reply: completion
-        )
+            if let response = self.sendRequest(request),
+               let success = response["success"] as? Bool {
+                let error = response["error"] as? String ?? ""
+                DispatchQueue.main.async { completion(success, error) }
+            } else {
+                DispatchQueue.main.async { completion(false, "No response") }
+            }
+        }
+    }
+
+    func relayData(flowId: String, data: Data, direction: String,
+                   completion: @escaping (Bool) -> Void) {
+        socketQueue.async { [weak self] in
+            guard let self = self, self.isConnected else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+
+            let request: [String: Any] = [
+                "type": "data",
+                "flow_id": flowId,
+                "direction": direction,
+                "data": data.base64EncodedString()
+            ]
+
+            if let response = self.sendRequest(request) {
+                let responseDirection = response["direction"] as? String ?? ""
+                let success = responseDirection != "error"
+                DispatchQueue.main.async { completion(success) }
+            } else {
+                DispatchQueue.main.async { completion(false) }
+            }
+        }
+    }
+
+    /// Receive inbound data for a flow (polling).
+    func receiveData(flowId: String, completion: @escaping (Data?) -> Void) {
+        socketQueue.async { [weak self] in
+            guard let self = self, self.isConnected else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+
+            // Send empty data request to poll for inbound data
+            let request: [String: Any] = [
+                "type": "data",
+                "flow_id": flowId,
+                "direction": "poll",
+                "data": ""
+            ]
+
+            if let response = self.sendRequest(request),
+               let direction = response["direction"] as? String,
+               direction == "inbound",
+               let dataStr = response["data"] as? String,
+               !dataStr.isEmpty,
+               let data = Data(base64Encoded: dataStr) {
+                DispatchQueue.main.async { completion(data) }
+            } else {
+                DispatchQueue.main.async { completion(nil) }
+            }
+        }
     }
 
     func flowClosed(flowId: String) {
-        if socketFd >= 0 {
-            // TODO: Send close notification over socket
-            return
-        }
+        socketQueue.async { [weak self] in
+            guard let self = self, self.isConnected else { return }
 
-        guard let proxy = connection?.remoteObjectProxy as? OmniLinkXPCProtocol else { return }
-        proxy.flowClosed(flowId: flowId)
+            let request: [String: Any] = [
+                "type": "close",
+                "flow_id": flowId
+            ]
+
+            // Fire and forget - no response expected
+            do {
+                try self.writeFrame(request)
+            } catch {
+                os_log("Failed to send close notification: %{public}@",
+                       log: self.log, type: .error, "\(error)")
+            }
+        }
+    }
+}
+
+// MARK: - Error Types
+
+enum XPCError: Error {
+    case notConnected
+    case writeError(Int32)
+    case readError(Int32)
+    case invalidLength(Int)
+    case invalidJSON
+
+    var localizedDescription: String {
+        switch self {
+        case .notConnected:
+            return "Socket not connected"
+        case .writeError(let errno):
+            return "Write error: \(String(cString: strerror(errno)))"
+        case .readError(let errno):
+            return "Read error: \(String(cString: strerror(errno)))"
+        case .invalidLength(let len):
+            return "Invalid message length: \(len)"
+        case .invalidJSON:
+            return "Invalid JSON response"
+        }
     }
 }
