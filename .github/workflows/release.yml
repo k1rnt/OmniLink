@@ -91,9 +91,14 @@ jobs:
 
       - name: Create Universal DMG
         run: |
+          # Create DMG contents folder
+          mkdir -p dmg-contents
+          cp -R universal/OmniLink.app dmg-contents/
+          ln -s /Applications dmg-contents/Applications
+
           # Create DMG
           hdiutil create -volname "OmniLink" \
-            -srcfolder universal/OmniLink.app \
+            -srcfolder dmg-contents \
             -ov -format UDZO \
             OmniLink-${{ github.ref_name }}-universal.dmg
 
