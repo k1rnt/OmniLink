@@ -42,7 +42,7 @@ jobs:
         working-directory: omnilink-ui
 
       - name: Build Tauri app
-        run: pnpm run tauri build -- --target ${{ matrix.target }}
+        run: pnpm tauri build --target ${{ matrix.target }}
         working-directory: omnilink-ui
 
       - name: Upload artifact
