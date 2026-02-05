@@ -1,3 +1,4 @@
+pub mod app_discovery;
 pub mod checker;
 pub mod config;
 pub mod credential;

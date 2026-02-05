@@ -1247,6 +1247,58 @@ async fn get_ne_status() -> Result<NEStatusInfo, String> {
     Err("Network Extension is only supported on macOS".to_string())
 }
 
+// ============================================================================
+// Application Discovery Commands
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct AppInfo {
+    pub name: String,
+    pub bundle_id: Option<String>,
+    pub executable_name: String,
+    pub executable_path: String,
+    pub icon_base64: Option<String>,
+    pub version: Option<String>,
+}
+
+/// List installed applications on the system.
+#[tauri::command]
+async fn list_installed_apps() -> Result<Vec<AppInfo>, String> {
+    let apps = omnilink_core::app_discovery::discover_apps();
+    Ok(apps
+        .into_iter()
+        .map(|a| AppInfo {
+            name: a.name,
+            bundle_id: a.bundle_id,
+            executable_name: a.executable_name,
+            executable_path: a.executable_path,
+            icon_base64: a.icon_base64,
+            version: a.version,
+        })
+        .collect())
+}
+
+/// Export current rules as YAML string.
+#[tauri::command]
+async fn export_rules_yaml(state: State<'_, SharedState>) -> Result<String, String> {
+    let state = state.lock().await;
+    let config = state.config.as_ref().ok_or("No config loaded")?;
+
+    // Build a rules-only config for export
+    #[derive(serde::Serialize)]
+    struct RulesExport {
+        rules: Vec<Rule>,
+        default_action: Action,
+    }
+
+    let export = RulesExport {
+        rules: config.rules.clone(),
+        default_action: config.default_action.clone(),
+    };
+
+    serde_yaml::to_string(&export).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let initial_state = AppStateInner {
@@ -1302,6 +1354,8 @@ pub fn run() {
             start_ne_server,
             stop_ne_server,
             get_ne_status,
+            list_installed_apps,
+            export_rules_yaml,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
