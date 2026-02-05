@@ -26,7 +26,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg", "msi", "nsis", "deb", "appimage"],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -55,6 +55,7 @@
   },
   "plugins": {
     "updater": {
+      "pubkey": "RWRKwi8RiBcrgLPV05ja9A07ZDt5VJaowB962fmMMz1hkmDeBlWp+a6J",
       "endpoints": [
         "https://github.com/k1rnt/OmniLink/releases/latest/download/latest.json"
       ]
