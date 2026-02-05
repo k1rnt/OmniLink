@@ -22,3 +22,14 @@ Thumbs.db
 # Node (for Tauri UI)
 node_modules/
 dist/
+
+# Swift / Xcode
+*.xcodeproj/
+*.xcworkspace/
+.build/
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
