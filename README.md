@@ -1,5 +1,8 @@
 # OmniLink
 
+> **Warning**
+> This project is under active development. Features may be incomplete or change without notice.
+
 A cross-platform transparent proxy client built with Rust and Tauri.
 
 OmniLink intercepts network traffic at the OS level and routes it through proxy servers based on user-defined rules. It supports Windows, macOS, and Linux with platform-native interception mechanisms.
@@ -29,6 +32,8 @@ OmniLink intercepts network traffic at the OS level and routes it through proxy 
 - **Cross-Platform UI** - Tauri + React desktop application
 - **Full CRUD Operations** - Create, edit, delete rules, proxies, and chains from the UI
 - **Connection Control** - Terminate active connections from the UI
+- **Apps Browser** - View installed applications and use app selector for easy process-based rule creation
+- **YAML Export** - Export rules to YAML format
 
 ## Architecture
 
