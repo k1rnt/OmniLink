@@ -7,7 +7,7 @@ use aya_ebpf::{
     programs::{SockAddrContext, SockOpsContext},
     EbpfContext,
 };
-use omnilink_ebpf_common::{InterceptConfig, OriginalDest, PortKey, SockKey};
+use omnilink_ebpf_common::{InterceptConfig, OriginalDest, PortKey, SockKey, UdpKey};
 
 // --- BPF Maps ---
 
@@ -22,6 +22,10 @@ static PORT_TO_COOKIE: HashMap<PortKey, u64> = HashMap::with_max_entries(65536, 
 /// Configuration array (single entry at index 0).
 #[map]
 static CONFIG: Array<InterceptConfig> = Array::with_max_entries(1, 0);
+
+/// UDP original destinations (keyed by cookie + dst for stateless packets).
+#[map]
+static UDP_ORIGINAL_DESTS: HashMap<UdpKey, OriginalDest> = HashMap::with_max_entries(65536, 0);
 
 // --- Program 1: cgroup/connect4 ---
 // Intercepts connect() syscall and redirects to local proxy.
@@ -118,6 +122,72 @@ fn try_sockops(ctx: &SockOpsContext) -> Result<u32, i64> {
 //
 // Instead, the userspace proxy queries the ORIGINAL_DESTS BPF map
 // directly using the socket cookie obtained via SO_COOKIE getsockopt.
+
+// --- Program 3: cgroup/sendmsg4 ---
+// Intercepts UDP sendto/sendmsg syscalls and redirects to local proxy.
+
+#[cgroup_sock_addr(sendmsg4)]
+pub fn sendmsg4_intercept(ctx: SockAddrContext) -> i32 {
+    match try_sendmsg4(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1, // Allow on error
+    }
+}
+
+fn try_sendmsg4(ctx: &SockAddrContext) -> Result<i32, i64> {
+    let config = unsafe { CONFIG.get(0) }.ok_or(0i64)?;
+
+    // Skip our proxy process to prevent routing loops
+    let pid_tgid = unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() };
+    let pid = (pid_tgid >> 32) as u32;
+    if pid == config.pid_self {
+        return Ok(1);
+    }
+
+    // Get socket cookie
+    let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr() as *mut _) };
+
+    // Read original destination
+    let dst_addr = unsafe { (*ctx.sock_addr).user_ip4 };
+    let dst_port = unsafe { (*ctx.sock_addr).user_port } as u16;
+
+    // Skip loopback (127.0.0.0/8 in network byte order)
+    if (dst_addr & 0x000000ff) == 0x0000007f {
+        return Ok(1);
+    }
+
+    // Skip DNS (port 53) - handled separately via VirtualDNS
+    // Port is in network byte order, so 53 = 0x3500
+    if dst_port == 0x3500 {
+        return Ok(1);
+    }
+
+    // Save original destination to BPF map
+    let key = UdpKey {
+        cookie,
+        dst_addr,
+        dst_port,
+        _pad: 0,
+    };
+    let value = OriginalDest {
+        addr: dst_addr,
+        port: dst_port,
+        _pad: 0,
+        pid,
+        _pad2: 0,
+    };
+    UDP_ORIGINAL_DESTS
+        .insert(&key, &value, 0)
+        .map_err(|e| e as i64)?;
+
+    // Redirect to local UDP proxy
+    unsafe {
+        (*ctx.sock_addr).user_ip4 = config.proxy_addr;
+        (*ctx.sock_addr).user_port = config.udp_proxy_port as u32;
+    }
+
+    Ok(1)
+}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

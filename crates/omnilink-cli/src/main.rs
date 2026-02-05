@@ -418,6 +418,16 @@ async fn cmd_intercept(config_path: &PathBuf) -> Result<()> {
                             }
                         });
                     }
+                    InterceptorEvent::NewUdpPacket(packet) => {
+                        // TODO: Handle UDP packets through proxy chain
+                        tracing::debug!(
+                            src = %packet.src_addr,
+                            dst = %packet.original_dst,
+                            len = packet.data.len(),
+                            process = ?packet.process_name,
+                            "intercepted UDP packet"
+                        );
+                    }
                 }
             }
             _ = &mut shutdown => {

@@ -32,10 +32,27 @@ pub struct InterceptedConnection {
     pub process_path: Option<String>,
 }
 
+/// Information about an intercepted UDP packet.
+#[derive(Debug, Clone)]
+pub struct InterceptedUdpPacket {
+    /// The original destination address the application was trying to reach.
+    pub original_dst: SocketAddr,
+    /// The source address of the sending application.
+    pub src_addr: SocketAddr,
+    /// The UDP payload data.
+    pub data: Vec<u8>,
+    /// The name of the process that sent this packet.
+    pub process_name: Option<String>,
+    /// The full path of the process executable.
+    pub process_path: Option<String>,
+}
+
 /// Events emitted by the interceptor.
 pub enum InterceptorEvent {
     /// A new TCP connection was intercepted.
     NewConnection(InterceptedConnection, TcpStream),
+    /// A new UDP packet was intercepted.
+    NewUdpPacket(InterceptedUdpPacket),
 }
 
 /// Trait for OS-level traffic interception.
