@@ -1317,7 +1317,17 @@ pub fn run() {
         interceptor_running: false,
     };
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Register updater and process plugins (desktop only)
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
+
+    builder
         .manage(Mutex::new(initial_state))
         .invoke_handler(tauri::generate_handler![
             get_sessions,
