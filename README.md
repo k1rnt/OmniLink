@@ -23,18 +23,21 @@ OmniLink intercepts network traffic at the OS level and routes it through proxy 
 ### Management
 - **Proxy Checker** - Built-in latency and connectivity checker
 - **Profile System** - Save and switch between named configuration profiles
-- **Connection Monitor** - Real-time connection list with filtering, search, and traffic statistics
+- **Connection Monitor** - Real-time connection list with filtering, search, process name detection, and traffic statistics
 - **Traffic Visualization** - Real-time bandwidth graph with per-proxy and per-domain statistics
 - **Secure Credential Storage** - OS keychain integration (macOS Keychain, Windows Credential Manager, Linux Secret Service)
-- **System Proxy** - Automatic system-wide proxy configuration
+- **System Proxy** - Automatic system-wide proxy configuration (auto-disables on service stop)
+- **Config Persistence** - Settings auto-saved to OS app data directory and restored on startup
 
 ### Desktop Application
 - **Cross-Platform UI** - Tauri + React desktop application
 - **Full CRUD Operations** - Create, edit, delete rules, proxies, and chains from the UI
 - **Connection Control** - Terminate active connections from the UI
 - **Apps Browser** - View installed applications and use app selector for easy process-based rule creation
+- **Native File Dialogs** - Load/export configuration via OS file picker (Finder, Explorer, etc.)
+- **Close Confirmation** - Prompts to export config before quitting
 - **YAML Export** - Export rules to YAML format
-- **Self-Update** - Built-in automatic update from GitHub Releases
+- **Self-Update** - Manual update check and install from Settings tab
 
 ## Architecture
 
@@ -73,7 +76,7 @@ OmniLink/
 ├── omnilink-ui/             # Tauri + React frontend
 │   ├── src/                 # React components
 │   └── src-tauri/           # Tauri Rust backend
-├── omnilink-ne/             # macOS Network Extension
+├── omnilink-ne/             # macOS Network Extension (NETransparentProxyProvider)
 ├── omnilink-wfp/            # Windows WFP driver + service
 ├── config.example.yaml      # Example configuration
 └── Cargo.toml               # Workspace root
@@ -84,7 +87,7 @@ OmniLink/
 ### Prerequisites
 
 - Rust 1.75+
-- Node.js 18+
+- Node.js 18+ and pnpm
 - Platform-specific: Xcode (macOS), GTK3/WebKit (Linux)
 
 ### Build
@@ -110,15 +113,24 @@ cargo run --bin omnilink-cli -- run -c config.yaml
 
 ```sh
 cd omnilink-ui
-npm install
-npm run tauri build
+pnpm install
+pnpm run tauri build
 ```
 
 ## Configuration
 
 OmniLink uses YAML configuration files. See `config.example.yaml` for a complete example.
 
+The desktop app automatically saves configuration to the OS app data directory and restores it on startup:
+- **macOS:** `~/Library/Application Support/com.omnilink.app/config.yaml`
+- **Windows:** `%APPDATA%/com.omnilink.app/config.yaml`
+- **Linux:** `~/.local/share/com.omnilink.app/config.yaml`
+
+You can also load/export config files via native file dialogs in the Settings tab.
+
 ### Proxy Servers
+
+Credentials are stored securely in the OS keychain, not in config files.
 
 ```yaml
 proxies:
@@ -126,9 +138,9 @@ proxies:
     protocol: !Socks5
     address: "proxy.example.com"
     port: 1080
-    auth:
-      username: user
-      password: pass
+    # Credentials stored in OS keychain. Set with:
+    #   omnilink credential set my-socks5 -u user -p pass
+    has_auth: true
 
   - name: my-http
     protocol: !Http
@@ -139,9 +151,7 @@ proxies:
     protocol: !Ssh
     address: "ssh.example.com"
     port: 22
-    auth:
-      username: user
-      private_key_path: ~/.ssh/id_rsa
+    has_auth: true
 ```
 
 ### Proxy Chains
@@ -152,7 +162,7 @@ chains:
     proxies:
       - my-socks5
       - my-http
-    mode: strict     # strict | failover | round_robin | random
+    mode: !strict    # strict | failover | round_robin | random
 ```
 
 ### Routing Rules
@@ -225,22 +235,26 @@ dns:
 
 ## Platform Support
 
-| Platform | Interception Method | Status |
-|----------|---------------------|--------|
-| macOS | Network Extension (NETransparentProxyProvider) | Implemented |
-| Linux | eBPF (connect4/sendmsg4 hooks) | Implemented |
-| Windows | WFP (Windows Filtering Platform) | Implemented |
+| Platform | Interception Method | SOCKS Listener | OS Interceptor |
+|----------|---------------------|---------------|----------------|
+| macOS | Network Extension (NETransparentProxyProvider) | Stable | Basic implementation |
+| Linux | eBPF (connect4/sendmsg4 hooks) | Stable | Basic implementation |
+| Windows | WFP (Windows Filtering Platform) | Stable | Skeleton |
+
+The SOCKS5 listener works on all platforms. OS-level interception (transparent proxying without per-app configuration) is under active development.
 
 ### Platform-Specific Notes
 
 **macOS:**
-- Requires System Extension approval in System Preferences
-- Network Extension requires app notarization for distribution (or Gatekeeper bypass for local builds)
+- Network Extension requires System Extension approval and app notarization for distribution
+- Process name detection via libproc FFI
+- Universal Binary (arm64 + x86_64) supported
 
 **Linux:**
-- eBPF requires kernel 5.8+ with BPF enabled
-- CAP_BPF or root privileges required
+- eBPF requires kernel 5.8+ with BPF enabled and CAP_BPF or root privileges
+- Process detection via `/proc/net/tcp` scanning
 
 **Windows:**
-- WFP driver requires kernel-mode code signing for production
+- WFP driver requires kernel-mode code signing (EV certificate) for production
 - Test signing mode available for development
+- Process detection via `OpenProcess` + `QueryFullProcessImageNameW`

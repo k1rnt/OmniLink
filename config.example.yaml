@@ -17,31 +17,43 @@ proxies:
     address: "httpproxy.example.com"
     port: 8080
 
+  - name: my-ssh
+    protocol: !SshTunnel
+    address: "ssh.example.com"
+    port: 22
+    has_auth: true
+
 chains:
   - name: double-hop
     proxies:
       - my-socks5
       - my-http
+    mode: !strict    # strict | failover | round_robin | random
 
 rules:
   - name: block-ads
     conditions:
-      - !domain "*.ads.example.com"
+      - !domain "*.ads.example.com;*.tracking.com"
     action: !block
     priority: 100
+    enabled: true
 
-  - name: proxy-private
+  - name: proxy-browsers
     conditions:
-      - !cidr "10.0.0.0/8"
+      - !process_name "chrome;firefox;safari"
     action:
       !proxy my-socks5
     priority: 50
+    enabled: true
 
   - name: direct-local
     conditions:
       - !cidr "192.168.0.0/16"
     action: !direct
     priority: 50
+    enabled: true
 
 dns:
   mode: !fake_ip
+
+default_action: !direct
