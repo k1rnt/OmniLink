@@ -58,10 +58,9 @@ export default function AppsView() {
     try {
       const req = {
         name: `App: ${selectedApp.name}`,
-        conditionType: "process_name",
-        conditionValue: selectedApp.executable_name,
+        conditions: [{ type: "process_name", value: selectedApp.executable_name }],
         action: appConfig.action,
-        proxyName: appConfig.action === "proxy" ? appConfig.proxyName || "" : "",
+        proxy_name: appConfig.action === "proxy" ? appConfig.proxyName || null : null,
         priority: 50,
       };
       await invoke("add_rule", { req });
