@@ -52,8 +52,8 @@ export function useUpdater() {
 
       setProgress({ status: 'idle', downloadedBytes: 0, totalBytes: 0 });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setProgress({ status: 'error', downloadedBytes: 0, totalBytes: 0 });
+      console.warn("Update check failed:", e);
+      setProgress({ status: 'idle', downloadedBytes: 0, totalBytes: 0 });
     }
   }, []);
 

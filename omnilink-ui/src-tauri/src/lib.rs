@@ -1303,7 +1303,7 @@ async fn export_rules_yaml(state: State<'_, SharedState>) -> Result<String, Stri
 pub fn run() {
     let initial_state = AppStateInner {
         running: false,
-        config: None,
+        config: Some(Config::default_config()),
         config_path: PathBuf::from("config.yaml"),
         session_manager: Arc::new(SessionManager::new(1000)),
         traffic_stats: Arc::new(TrafficStats::new()),

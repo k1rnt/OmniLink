@@ -55,7 +55,7 @@ function RulesView() {
       await invoke("toggle_rule", { index });
       await fetchRules();
     } catch (e) {
-      console.error("Failed to toggle rule:", e);
+      alert(`Failed to toggle rule: ${e}`);
     }
   };
 
@@ -64,7 +64,7 @@ function RulesView() {
       await invoke("delete_rule", { index });
       await fetchRules();
     } catch (e) {
-      console.error("Failed to delete rule:", e);
+      alert(`Failed to delete rule: ${e}`);
     }
   };
 
@@ -92,7 +92,7 @@ function RulesView() {
       setShowForm(false);
       await fetchRules();
     } catch (e) {
-      console.error("Failed to add rule:", e);
+      alert(`Failed to add rule: ${e}`);
     }
   };
 

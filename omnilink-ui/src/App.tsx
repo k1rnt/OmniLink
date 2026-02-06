@@ -51,7 +51,7 @@ function App() {
       }
       await fetchStatus();
     } catch (e) {
-      console.error("Service toggle error:", e);
+      alert(`Service error: ${e}`);
     }
   };
 
