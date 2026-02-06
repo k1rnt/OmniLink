@@ -55,7 +55,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "RWRKwi8RiBcrgLPV05ja9A07ZDt5VJaowB962fmMMz1hkmDeBlWp+a6J",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwMzBBMjVBNTQ2RURCNEIKUldSTDIyNVVXcUl3Z0lrZnlZVVVMcGpvckhtR2U0eEc1bSt4S1pERS96UGJKbEtiV3ZIZFduekMK",
       "endpoints": [
         "https://github.com/k1rnt/OmniLink/releases/latest/download/latest.json"
       ]
