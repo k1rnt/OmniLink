@@ -910,7 +910,14 @@ async fn run_service(
     tracing::info!(addr = %listen_addr, "tauri service listening");
 
     loop {
-        let (mut inbound, peer_addr) = listener.accept().await?;
+        let (mut inbound, peer_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed, retrying");
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                continue;
+            }
+        };
         tracing::debug!(peer = %peer_addr, "accepted connection");
 
         let rule_engine = rule_engine.clone();
@@ -1036,12 +1043,17 @@ async fn handle_connection(
         ProxyDestination::Domain(_, p) => *p,
     };
 
-    // Look up the originating process from the SOCKS5 client's source port
-    let proc_info = tokio::task::spawn_blocking(move || {
-        omnilink_tun::process::lookup_process_by_socket(&peer_addr)
-    })
+    // Look up the originating process from the SOCKS5 client's source port.
+    // Use a timeout to avoid blocking when the system is under heavy load.
+    let proc_info = tokio::time::timeout(
+        tokio::time::Duration::from_millis(200),
+        tokio::task::spawn_blocking(move || {
+            omnilink_tun::process::lookup_process_by_socket(&peer_addr)
+        }),
+    )
     .await
     .ok()
+    .and_then(|r| r.ok())
     .flatten();
 
     let process_name = proc_info.as_ref().map(|p| p.name.clone());
