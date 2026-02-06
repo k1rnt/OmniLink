@@ -393,11 +393,11 @@ mod macos {
             return false;
         }
 
-        // Compare local address
+        // Compare local address (allow INADDR_ANY as wildcard match)
         let local_addr_raw =
             unsafe { ini.insi_laddr.ina_46.i46a_addr4.s_addr };
         let local_ip = Ipv4Addr::from(u32::from_be(local_addr_raw));
-        if local_ip != *target_addr.ip() {
+        if local_ip != *target_addr.ip() && !local_ip.is_unspecified() {
             return false;
         }
 

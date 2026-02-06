@@ -168,6 +168,16 @@ fn open_pf_dev() -> Result<RawFd, InterceptorError> {
 }
 
 /// Install pf anchor rules for transparent TCP redirection.
+///
+/// Two steps are required:
+/// 1. Load rules into the named anchor (`pfctl -a <anchor> -f -`)
+/// 2. Add `rdr-anchor` and `anchor` references to the **main** ruleset so that
+///    pf actually evaluates our anchor. macOS's default `/etc/pf.conf` only
+///    references `com.apple/*`, so without this step the anchor is loaded but
+///    never evaluated.
+///
+/// We reload the main ruleset from `/etc/pf.conf` plus our anchor references
+/// via `pfctl -f -` (in-memory only; `/etc/pf.conf` is never modified).
 fn install_pf_rules(
     iface: &str,
     listener_port: u16,
@@ -200,28 +210,40 @@ fn install_pf_rules(
         iface, self_uid
     ));
 
-    // Install rules via pfctl with admin privileges
+    // Step 1: Load anchor rules
+    // Step 2: Add anchor references to the main ruleset (append to /etc/pf.conf content)
+    // Step 3: Enable pf
     let cmd = format!(
-        "echo '{}' | pfctl -a {} -f - 2>&1 && pfctl -e 2>&1 || true",
+        "echo '{}' | pfctl -a {} -f - 2>&1 && \
+         {{ cat /etc/pf.conf; echo 'rdr-anchor \"{}\"'; echo 'anchor \"{}\"'; }} | pfctl -f - 2>&1 && \
+         pfctl -e 2>&1 || true",
         rules.replace('\'', "'\\''"),
-        ANCHOR_NAME
+        ANCHOR_NAME,
+        ANCHOR_NAME,
+        ANCHOR_NAME,
     );
 
-    tracing::debug!(rules = %rules, "installing pf rules");
+    tracing::debug!(rules = %rules, "installing pf rules with anchor references");
 
     privilege::run_with_admin_privileges(&cmd).map_err(|e| {
         InterceptorError::RoutingSetup(format!("failed to install pf rules: {}", e))
     })?;
 
-    tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules installed");
+    tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules and references installed");
     Ok(())
 }
 
-/// Flush pf anchor rules (best-effort, used during stop).
+/// Flush pf anchor rules and restore the original main ruleset (best-effort).
+///
+/// 1. Flush all rules inside our anchor.
+/// 2. Reload `/etc/pf.conf` into the main ruleset to remove our anchor references.
 fn flush_pf_rules() {
-    let cmd = format!("pfctl -a {} -F all 2>&1 || true", ANCHOR_NAME);
+    let cmd = format!(
+        "pfctl -a {} -F all 2>&1; pfctl -f /etc/pf.conf 2>&1 || true",
+        ANCHOR_NAME,
+    );
     match privilege::run_with_admin_privileges(&cmd) {
-        Ok(_) => tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules flushed"),
+        Ok(_) => tracing::info!(anchor = ANCHOR_NAME, "pf rules flushed and main config restored"),
         Err(e) => tracing::warn!(error = %e, "failed to flush pf rules (may need manual cleanup)"),
     }
 }
