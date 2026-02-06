@@ -69,7 +69,14 @@ function RulesView() {
   };
 
   const handleAdd = async () => {
-    if (!form.name || !form.conditionValue) return;
+    if (!form.name) {
+      alert("Please enter a rule name");
+      return;
+    }
+    if (!form.conditionValue) {
+      alert("Please enter a condition value");
+      return;
+    }
 
     const condition = {
       type: form.conditionType,
