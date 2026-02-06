@@ -1,8 +1,10 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Session } from "../types";
 
 type FilterMode = "all" | "active" | "closed";
+
+const MAX_RENDERED_ROWS = 200;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -45,6 +47,8 @@ function ConnectionsView() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     visible: false, x: 0, y: 0, session: null,
   });
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -61,19 +65,27 @@ function ConnectionsView() {
     return () => clearInterval(interval);
   }, [fetchSessions]);
 
-  const filteredSessions = sessions.filter((s) => {
-    if (filter === "active" && s.status !== "active" && s.status !== "connecting") return false;
-    if (filter === "closed" && s.status !== "closed") return false;
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      return (
-        (s.process_name?.toLowerCase().includes(q) ?? false) ||
-        s.destination.toLowerCase().includes(q) ||
-        s.action.toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
+  const filteredSessions = useMemo(() => {
+    const filtered = sessions.filter((s) => {
+      if (filter === "active" && s.status !== "active" && s.status !== "connecting") return false;
+      if (filter === "closed" && s.status !== "closed") return false;
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        return (
+          (s.process_name?.toLowerCase().includes(q) ?? false) ||
+          s.destination.toLowerCase().includes(q) ||
+          s.action.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+    return filtered;
+  }, [sessions, filter, searchQuery]);
+
+  const displayedSessions = useMemo(
+    () => filteredSessions.slice(0, MAX_RENDERED_ROWS),
+    [filteredSessions]
+  );
 
   const handleContextMenu = useCallback((e: React.MouseEvent, session: Session) => {
     e.preventDefault();
@@ -123,8 +135,17 @@ function ConnectionsView() {
     closeContextMenu();
   }, [contextMenu.session, closeContextMenu]);
 
-  const totalSent = sessions.reduce((a, s) => a + s.bytes_sent, 0);
-  const totalRecv = sessions.reduce((a, s) => a + s.bytes_received, 0);
+  const handleClearClosed = useCallback(async () => {
+    try {
+      await invoke("clear_closed_sessions");
+      await fetchSessions();
+    } catch (e) {
+      console.error("Failed to clear sessions:", e);
+    }
+  }, [fetchSessions]);
+
+  const totalSent = useMemo(() => sessions.reduce((a, s) => a + s.bytes_sent, 0), [sessions]);
+  const totalRecv = useMemo(() => sessions.reduce((a, s) => a + s.bytes_received, 0), [sessions]);
 
   return (
     <div onClick={closeContextMenu}>
@@ -139,6 +160,9 @@ function ConnectionsView() {
               {f.charAt(0).toUpperCase() + f.slice(1)}
             </button>
           ))}
+          <button className="btn" onClick={handleClearClosed} title="Remove all closed connections">
+            Clear Closed
+          </button>
         </div>
         <input
           className="search-input"
@@ -148,7 +172,10 @@ function ConnectionsView() {
           onChange={(e) => setSearchQuery(e.target.value)}
         />
         <div className="traffic-summary">
-          Sent: {formatBytes(totalSent)} | Recv: {formatBytes(totalRecv)}
+          {filteredSessions.length !== sessions.length && (
+            <span>{filteredSessions.length} / </span>
+          )}
+          {sessions.length} conn | Sent: {formatBytes(totalSent)} | Recv: {formatBytes(totalRecv)}
         </div>
       </div>
 
@@ -160,45 +187,54 @@ function ConnectionsView() {
           </div>
         </div>
       ) : (
-        <table className="connection-list">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Status</th>
-              <th>Process</th>
-              <th>Destination</th>
-              <th>Action</th>
-              <th>Sent</th>
-              <th>Received</th>
-              <th>Duration</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredSessions.map((session) => (
-              <tr
-                key={session.id}
-                onContextMenu={(e) => handleContextMenu(e, session)}
-              >
-                <td>{session.id}</td>
-                <td>
-                  <span className={`badge ${getStatusBadge(session.status)}`}>
-                    {session.status}
-                  </span>
-                </td>
-                <td>{session.process_name ?? "-"}</td>
-                <td>{session.destination}</td>
-                <td>
-                  <span className={`badge ${getActionBadge(session.action)}`}>
-                    {session.action}
-                  </span>
-                </td>
-                <td>{formatBytes(session.bytes_sent)}</td>
-                <td>{formatBytes(session.bytes_received)}</td>
-                <td>{formatDuration(session.elapsed_ms)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <>
+          <div style={{ maxHeight: "calc(100vh - 180px)", overflowY: "auto" }}>
+            <table className="connection-list">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Status</th>
+                  <th>Process</th>
+                  <th>Destination</th>
+                  <th>Action</th>
+                  <th>Sent</th>
+                  <th>Received</th>
+                  <th>Duration</th>
+                </tr>
+              </thead>
+              <tbody>
+                {displayedSessions.map((session) => (
+                  <tr
+                    key={session.id}
+                    onContextMenu={(e) => handleContextMenu(e, session)}
+                  >
+                    <td>{session.id}</td>
+                    <td>
+                      <span className={`badge ${getStatusBadge(session.status)}`}>
+                        {session.status}
+                      </span>
+                    </td>
+                    <td>{session.process_name ?? "-"}</td>
+                    <td>{session.destination}</td>
+                    <td>
+                      <span className={`badge ${getActionBadge(session.action)}`}>
+                        {session.action}
+                      </span>
+                    </td>
+                    <td>{formatBytes(session.bytes_sent)}</td>
+                    <td>{formatBytes(session.bytes_received)}</td>
+                    <td>{formatDuration(session.elapsed_ms)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {filteredSessions.length > MAX_RENDERED_ROWS && (
+            <div style={{ textAlign: "center", padding: "8px", color: "var(--text-secondary)", fontSize: 12 }}>
+              Showing {MAX_RENDERED_ROWS} of {filteredSessions.length} connections
+            </div>
+          )}
+        </>
       )}
 
       {contextMenu.visible && contextMenu.session && (
