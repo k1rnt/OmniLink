@@ -6,6 +6,9 @@ CLAUDE.md
 .DS_Store
 .claude/
 
+# Signing keys (private key must never be committed)
+omnilink.key
+
 # Rust
 /target
 **/*.rs.bk
