@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { useUpdater } from "../hooks/useUpdater";
 import type { AppState } from "../types";
 
@@ -27,7 +28,12 @@ function SettingsView({ state }: Props) {
   const [message, setMessage] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [newProfileName, setNewProfileName] = useState("");
+  const [appVersion, setAppVersion] = useState("");
   const { updateInfo, progress, error, checkForUpdates, downloadAndInstall, restartApp } = useUpdater();
+
+  useEffect(() => {
+    getVersion().then(setAppVersion);
+  }, []);
 
   const fetchProfiles = useCallback(async () => {
     try {
@@ -116,7 +122,7 @@ function SettingsView({ state }: Props) {
         <h3>Updates</h3>
         <div className="setting-row">
           <span className="setting-label">Current Version</span>
-          <span className="setting-value">v{updateInfo.currentVersion}</span>
+          <span className="setting-value">v{appVersion}</span>
         </div>
         <div className="setting-row">
           <span className="setting-label">Check for Updates</span>

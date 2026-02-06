@@ -18,7 +18,7 @@ export interface UpdateProgress {
 export function useUpdater() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({
     available: false,
-    currentVersion: '0.1.0',
+    currentVersion: '',
     newVersion: null,
     releaseNotes: null,
   });
