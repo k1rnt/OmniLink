@@ -86,6 +86,9 @@ jobs:
           # Create universal binary using lipo
           lipo -create "$ARM64_BIN" "$X86_BIN" -output universal/OmniLink.app/Contents/MacOS/omnilink-tauri
 
+          # Restore executable permission (lost during artifact upload/download)
+          chmod +x universal/OmniLink.app/Contents/MacOS/omnilink-tauri
+
           # Verify
           file universal/OmniLink.app/Contents/MacOS/omnilink-tauri
 
