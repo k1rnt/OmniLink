@@ -6,7 +6,6 @@ import ProxiesView from "./components/ProxiesView";
 import SettingsView from "./components/SettingsView";
 import TrafficView from "./components/TrafficView";
 import AppsView from "./components/AppsView";
-import UpdateNotification from "./components/UpdateNotification";
 import type { AppState } from "./types";
 
 type Tab = "connections" | "rules" | "apps" | "proxies" | "traffic" | "settings";
@@ -96,8 +95,6 @@ function App() {
         <span>Active: {appState.active_connections} | Total: {appState.total_connections}</span>
         <span>DNS: {appState.dns_mode}</span>
       </div>
-
-      <UpdateNotification />
     </div>
   );
 }

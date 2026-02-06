@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useUpdater } from "../hooks/useUpdater";
 import type { AppState } from "../types";
 
 interface ProfileInfo {
@@ -12,12 +13,21 @@ interface Props {
   state: AppState;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
 function SettingsView({ state }: Props) {
   const [sysproxyEnabled, setSysproxyEnabled] = useState(false);
   const [configPath, setConfigPath] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [newProfileName, setNewProfileName] = useState("");
+  const { updateInfo, progress, error, checkForUpdates, downloadAndInstall, restartApp } = useUpdater();
 
   const fetchProfiles = useCallback(async () => {
     try {
@@ -101,6 +111,87 @@ function SettingsView({ state }: Props) {
           {message}
         </div>
       )}
+
+      <div className="setting-group">
+        <h3>Updates</h3>
+        <div className="setting-row">
+          <span className="setting-label">Current Version</span>
+          <span className="setting-value">v{updateInfo.currentVersion}</span>
+        </div>
+        <div className="setting-row">
+          <span className="setting-label">Check for Updates</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {progress.status === "checking" ? (
+              <span className="setting-value">Checking...</span>
+            ) : (
+              <button
+                className="btn btn-primary"
+                style={{ padding: "3px 10px", fontSize: 11 }}
+                onClick={checkForUpdates}
+              >
+                Check Now
+              </button>
+            )}
+          </div>
+        </div>
+        {updateInfo.available && progress.status === "idle" && (
+          <div className="setting-row">
+            <span className="setting-label">
+              New version available: <strong>v{updateInfo.newVersion}</strong>
+            </span>
+            <button
+              className="btn btn-primary"
+              style={{ padding: "3px 10px", fontSize: 11 }}
+              onClick={downloadAndInstall}
+            >
+              Download & Install
+            </button>
+          </div>
+        )}
+        {progress.status === "downloading" && (
+          <div className="setting-row">
+            <span className="setting-label">Downloading</span>
+            <span className="setting-value">
+              {progress.totalBytes > 0
+                ? `${Math.round((progress.downloadedBytes / progress.totalBytes) * 100)}% (${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)})`
+                : `${formatBytes(progress.downloadedBytes)}`}
+            </span>
+          </div>
+        )}
+        {progress.status === "ready" && (
+          <div className="setting-row">
+            <span className="setting-label">Update ready</span>
+            <button
+              className="btn btn-primary"
+              style={{ padding: "3px 10px", fontSize: 11 }}
+              onClick={restartApp}
+            >
+              Restart Now
+            </button>
+          </div>
+        )}
+        {progress.status === "error" && error && (
+          <div className="setting-row">
+            <span className="setting-label" style={{ color: "var(--error)" }}>
+              Error: {error}
+            </span>
+            <button
+              className="btn"
+              style={{ padding: "3px 10px", fontSize: 11 }}
+              onClick={checkForUpdates}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {!updateInfo.available && progress.status === "idle" && (
+          <div className="setting-row">
+            <span className="setting-label" style={{ color: "var(--text-secondary)" }}>
+              You're up to date
+            </span>
+          </div>
+        )}
+      </div>
 
       <div className="setting-group">
         <h3>General</h3>
