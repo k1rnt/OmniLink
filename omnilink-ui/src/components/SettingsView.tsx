@@ -39,6 +39,7 @@ function SettingsView({ state }: Props) {
   const [appVersion, setAppVersion] = useState("");
   const [isMacOS] = useState(() => navigator.platform.toUpperCase().includes("MAC"));
   const [neStatus, setNeStatus] = useState<NEStatusInfo>({ installed: false, enabled: false, running: false, server_running: false });
+  const [pfStatus, setPfStatus] = useState(false);
   const { updateInfo, progress, error, checkForUpdates, downloadAndInstall, restartApp } = useUpdater();
 
   useEffect(() => {
@@ -73,11 +74,22 @@ function SettingsView({ state }: Props) {
     }
   }, [isMacOS]);
 
+  const fetchPfStatus = useCallback(async () => {
+    if (!isMacOS) return;
+    try {
+      const running = await invoke<boolean>("get_pf_interceptor_status");
+      setPfStatus(running);
+    } catch (e) {
+      console.error("Failed to fetch pf status:", e);
+    }
+  }, [isMacOS]);
+
   useEffect(() => {
     fetchSysproxy();
     fetchProfiles();
     fetchNeStatus();
-  }, [fetchSysproxy, fetchProfiles, fetchNeStatus]);
+    fetchPfStatus();
+  }, [fetchSysproxy, fetchProfiles, fetchNeStatus, fetchPfStatus]);
 
   const showMessage = (msg: string) => {
     if (msg.toLowerCase().startsWith("error")) {
@@ -267,13 +279,11 @@ function SettingsView({ state }: Props) {
       </div>
 
       {isMacOS && (
-        <div className="setting-group">
+        <div className="setting-group" style={{ opacity: 0.5 }}>
           <h3>Network Extension (macOS)</h3>
           <div className="setting-row">
             <span className="setting-label">Extension Status</span>
-            <span className="setting-value">
-              {neStatus.installed ? (neStatus.running ? "Running" : "Installed") : "Not Installed"}
-            </span>
+            <span className="setting-value">Not Available</span>
           </div>
           <div className="setting-row">
             <span className="setting-label">NE Server</span>
@@ -282,18 +292,9 @@ function SettingsView({ state }: Props) {
                 {neStatus.server_running ? "Running" : "Stopped"}
               </span>
               <button
-                className={`btn ${neStatus.server_running ? "" : "btn-primary"}`}
+                className="btn"
                 style={{ padding: "3px 10px", fontSize: 11 }}
-                onClick={async () => {
-                  try {
-                    const cmd = neStatus.server_running ? "stop_ne_server" : "start_ne_server";
-                    const result = await invoke<string>(cmd);
-                    showMessage(result);
-                    await fetchNeStatus();
-                  } catch (e) {
-                    showMessage(`Error: ${e}`);
-                  }
-                }}
+                disabled
               >
                 {neStatus.server_running ? "Stop" : "Start"}
               </button>
@@ -304,8 +305,47 @@ function SettingsView({ state }: Props) {
               className="setting-label"
               style={{ fontSize: 11, color: "var(--text-secondary)" }}
             >
-              Network Extension captures all TCP/UDP traffic at the OS level.
-              Requires Apple entitlement for distribution.
+              Requires Apple Developer Program membership.
+              Use "Transparent Proxy (pf)" below instead.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {isMacOS && (
+        <div className="setting-group">
+          <h3>Transparent Proxy (pf)</h3>
+          <div className="setting-row">
+            <span className="setting-label">Status</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span className="setting-value">
+                {pfStatus ? "Running" : "Stopped"}
+              </span>
+              <button
+                className={`btn ${pfStatus ? "" : "btn-primary"}`}
+                style={{ padding: "3px 10px", fontSize: 11 }}
+                onClick={async () => {
+                  try {
+                    const cmd = pfStatus ? "stop_pf_interceptor" : "start_pf_interceptor";
+                    const result = await invoke<string>(cmd);
+                    showMessage(result);
+                    await fetchPfStatus();
+                  } catch (e) {
+                    showMessage(`Error: ${e}`);
+                  }
+                }}
+              >
+                {pfStatus ? "Stop" : "Start"}
+              </button>
+            </div>
+          </div>
+          <div className="setting-row">
+            <span
+              className="setting-label"
+              style={{ fontSize: 11, color: "var(--text-secondary)" }}
+            >
+              Intercepts TCP traffic using macOS Packet Filter (pf).
+              Requires admin password. No Apple Developer membership needed.
             </span>
           </div>
         </div>

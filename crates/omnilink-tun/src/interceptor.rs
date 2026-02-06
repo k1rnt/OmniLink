@@ -15,6 +15,8 @@ pub enum InterceptorError {
     RoutingSetup(String),
     #[error("interceptor already running")]
     AlreadyRunning,
+    #[error("administrator privileges required: {0}")]
+    PrivilegeRequired(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

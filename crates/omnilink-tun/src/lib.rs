@@ -49,6 +49,18 @@ pub fn create_ne_interceptor(
     Box::new(interceptor)
 }
 
+/// Create a pf (Packet Filter) based interceptor for macOS.
+///
+/// This interceptor does not require Apple Developer Program membership.
+/// It uses macOS's built-in packet filter to redirect TCP traffic and requires
+/// administrator privileges for pfctl and /dev/pf access.
+#[cfg(target_os = "macos")]
+pub fn create_pf_interceptor(
+    excluded_ips: Vec<std::net::Ipv4Addr>,
+) -> Box<dyn interceptor::Interceptor> {
+    Box::new(macos::pf_interceptor::PfInterceptor::new(excluded_ips))
+}
+
 #[cfg(target_os = "linux")]
 pub fn create_interceptor(
     virtual_dns: std::sync::Arc<omnilink_core::dns::VirtualDns>,

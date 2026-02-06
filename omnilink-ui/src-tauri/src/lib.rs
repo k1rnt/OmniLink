@@ -51,6 +51,10 @@ pub struct AppStateInner {
     /// NE interceptor instance (for stopping the socket server).
     ne_interceptor: Option<Box<dyn omnilink_tun::interceptor::Interceptor>>,
     ne_server_running: bool,
+    /// pf interceptor instance.
+    pf_interceptor: Option<Box<dyn omnilink_tun::interceptor::Interceptor>>,
+    pf_interceptor_handle: Option<tokio::task::JoinHandle<()>>,
+    pf_interceptor_running: bool,
 }
 
 pub type SharedState = Mutex<AppStateInner>;
@@ -1462,6 +1466,286 @@ async fn get_ne_status(_state: State<'_, SharedState>) -> Result<NEStatusInfo, S
     Err("Network Extension is only supported on macOS".to_string())
 }
 
+// --- pf (Packet Filter) Interceptor (macOS) ---
+
+/// Start the pf-based transparent proxy interceptor.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn start_pf_interceptor(state: State<'_, SharedState>) -> Result<String, String> {
+    let mut state_guard = state.lock().await;
+
+    if state_guard.pf_interceptor_running {
+        return Err("pf interceptor is already running".to_string());
+    }
+
+    let config = state_guard.config.clone().ok_or("No configuration loaded")?;
+
+    // Build rule engine
+    let rule_engine = Arc::new(RuleEngine::with_default_action(
+        config.rules.clone(),
+        config.default_action.clone(),
+    ));
+
+    // Build proxy map and chain relay
+    let mut proxy_map = HashMap::new();
+    for proxy_cfg in &config.proxies {
+        let server = proxy_cfg.to_proxy_server().map_err(|e| e.to_string())?;
+        proxy_map.insert(proxy_cfg.name.clone(), server);
+    }
+    let chain_relay = Arc::new(ChainRelay::new(config.chains.clone(), proxy_map));
+
+    // Collect excluded IPs (proxy server addresses to prevent loops)
+    let mut excluded_ips = Vec::new();
+    for proxy_cfg in &config.proxies {
+        if let Ok(ip) = proxy_cfg.address.parse::<std::net::Ipv4Addr>() {
+            excluded_ips.push(ip);
+        }
+    }
+
+    let virtual_dns = state_guard.virtual_dns.clone();
+    let session_manager = state_guard.session_manager.clone();
+    let traffic_stats = state_guard.traffic_stats.clone();
+    let mut interceptor = omnilink_tun::create_pf_interceptor(excluded_ips);
+
+    let mut event_rx = interceptor
+        .start()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let connection_handles = state_guard.connection_handles.clone();
+
+    let handle = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                omnilink_tun::interceptor::InterceptorEvent::NewConnection(conn, inbound) => {
+                    let rule_engine = rule_engine.clone();
+                    let virtual_dns = virtual_dns.clone();
+                    let chain_relay = chain_relay.clone();
+                    let session_manager = session_manager.clone();
+                    let traffic_stats = traffic_stats.clone();
+                    let connection_handles = connection_handles.clone();
+
+                    tokio::spawn(async move {
+                        use omnilink_core::proxy::ProxyDestination;
+                        use omnilink_core::rule::MatchContext;
+
+                        let dst_ip = conn.original_dst.ip();
+                        let dst_port = conn.original_dst.port();
+                        let domain = virtual_dns.lookup(dst_ip);
+
+                        let dest = if let Some(ref d) = domain {
+                            ProxyDestination::Domain(d.clone(), dst_port)
+                        } else {
+                            ProxyDestination::SocketAddr(conn.original_dst)
+                        };
+
+                        let ctx = MatchContext {
+                            process_name: conn.process_name.clone(),
+                            process_path: conn.process_path.clone(),
+                            process_user: None,
+                            dest_domain: domain,
+                            dest_ip: Some(dst_ip),
+                            dest_port: dst_port,
+                        };
+
+                        let action = rule_engine.evaluate(&ctx);
+                        let dest_str = match &dest {
+                            ProxyDestination::SocketAddr(a) => a.to_string(),
+                            ProxyDestination::Domain(d, p) => format!("{}:{}", d, p),
+                        };
+
+                        let proxy_name = match &action {
+                            Action::Proxy(name) => Some(name.clone()),
+                            _ => None,
+                        };
+
+                        let session_id = session_manager.create_session(
+                            dest_str.clone(),
+                            &action,
+                            proxy_name.clone(),
+                        );
+                        session_manager.set_process_name(
+                            session_id,
+                            conn.process_name.clone(),
+                            conn.process_path.clone(),
+                        );
+                        traffic_stats.record_connection_open(
+                            proxy_name.as_deref(),
+                            ctx.dest_domain.as_deref(),
+                        );
+
+                        let cancel_token = tokio_util::sync::CancellationToken::new();
+                        connection_handles.lock().await.insert(session_id, cancel_token.clone());
+
+                        let dest_domain_clone = ctx.dest_domain.clone();
+                        let result = handle_pf_connection(
+                            inbound, dest, &action, &chain_relay,
+                            &session_manager, &traffic_stats, session_id,
+                            cancel_token, proxy_name, dest_domain_clone,
+                        ).await;
+
+                        connection_handles.lock().await.remove(&session_id);
+
+                        if let Err(e) = result {
+                            tracing::debug!(session = session_id, error = %e, "pf connection ended");
+                        }
+                    });
+                }
+                omnilink_tun::interceptor::InterceptorEvent::NewUdpPacket(packet) => {
+                    tracing::debug!(
+                        src = %packet.src_addr,
+                        dst = %packet.original_dst,
+                        len = packet.data.len(),
+                        process = ?packet.process_name,
+                        "pf: intercepted UDP packet"
+                    );
+                }
+            }
+        }
+    });
+
+    state_guard.pf_interceptor = Some(interceptor);
+    state_guard.pf_interceptor_handle = Some(handle);
+    state_guard.pf_interceptor_running = true;
+
+    tracing::info!("pf interceptor started");
+    Ok("pf interceptor started".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn start_pf_interceptor(_state: State<'_, SharedState>) -> Result<String, String> {
+    Err("pf interceptor is only supported on macOS".to_string())
+}
+
+/// Stop the pf-based transparent proxy interceptor.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn stop_pf_interceptor(state: State<'_, SharedState>) -> Result<String, String> {
+    let mut state_guard = state.lock().await;
+
+    if !state_guard.pf_interceptor_running {
+        return Err("pf interceptor is not running".to_string());
+    }
+
+    if let Some(handle) = state_guard.pf_interceptor_handle.take() {
+        handle.abort();
+    }
+
+    if let Some(mut interceptor) = state_guard.pf_interceptor.take() {
+        interceptor.stop().await.map_err(|e| format!("Failed to stop pf interceptor: {}", e))?;
+    }
+
+    state_guard.pf_interceptor_running = false;
+    tracing::info!("pf interceptor stopped");
+
+    Ok("pf interceptor stopped".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn stop_pf_interceptor(_state: State<'_, SharedState>) -> Result<String, String> {
+    Err("pf interceptor is only supported on macOS".to_string())
+}
+
+/// Get pf interceptor running status.
+#[tauri::command]
+async fn get_pf_interceptor_status(state: State<'_, SharedState>) -> Result<bool, String> {
+    let state_guard = state.lock().await;
+    Ok(state_guard.pf_interceptor_running)
+}
+
+/// Handle a single pf-intercepted connection.
+#[cfg(target_os = "macos")]
+async fn handle_pf_connection(
+    mut inbound: tokio::net::TcpStream,
+    dest: omnilink_core::proxy::ProxyDestination,
+    action: &Action,
+    chain_relay: &Arc<ChainRelay>,
+    session_manager: &Arc<SessionManager>,
+    traffic_stats: &Arc<TrafficStats>,
+    session_id: u64,
+    cancel_token: tokio_util::sync::CancellationToken,
+    proxy_name: Option<String>,
+    dest_domain: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use omnilink_core::session::SessionStatus;
+
+    match action {
+        Action::Block => {
+            session_manager.update_status(session_id, SessionStatus::Closed);
+            traffic_stats.record_connection_close();
+            Ok(())
+        }
+        Action::Direct => {
+            session_manager.update_status(session_id, SessionStatus::Active);
+            let target = match &dest {
+                omnilink_core::proxy::ProxyDestination::SocketAddr(a) => a.to_string(),
+                omnilink_core::proxy::ProxyDestination::Domain(d, p) => format!("{}:{}", d, p),
+            };
+            match tokio::net::TcpStream::connect(&target).await {
+                Ok(mut outbound) => {
+                    let (mut ri, mut wi) = inbound.split();
+                    let (mut ro, mut wo) = outbound.split();
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {}
+                        result = async {
+                            tokio::try_join!(
+                                tokio::io::copy(&mut ri, &mut wo),
+                                tokio::io::copy(&mut ro, &mut wi),
+                            )
+                        } => {
+                            if let Ok((sent, received)) = result {
+                                session_manager.update_bytes(session_id, sent, received);
+                                traffic_stats.record_bytes(sent, received, proxy_name.as_deref(), dest_domain.as_deref());
+                            }
+                        }
+                    }
+                    session_manager.update_status(session_id, SessionStatus::Closed);
+                    traffic_stats.record_connection_close();
+                    Ok(())
+                }
+                Err(e) => {
+                    session_manager.update_status(session_id, SessionStatus::Error(e.to_string()));
+                    traffic_stats.record_connection_close();
+                    Err(e.into())
+                }
+            }
+        }
+        Action::Proxy(pname) => {
+            session_manager.update_status(session_id, SessionStatus::Active);
+            match chain_relay.connect(pname, &dest).await {
+                Ok(mut outbound) => {
+                    let (mut ri, mut wi) = inbound.split();
+                    let (mut ro, mut wo) = outbound.split();
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {}
+                        result = async {
+                            tokio::try_join!(
+                                tokio::io::copy(&mut ri, &mut wo),
+                                tokio::io::copy(&mut ro, &mut wi),
+                            )
+                        } => {
+                            if let Ok((sent, received)) = result {
+                                session_manager.update_bytes(session_id, sent, received);
+                                traffic_stats.record_bytes(sent, received, proxy_name.as_deref(), dest_domain.as_deref());
+                            }
+                        }
+                    }
+                    session_manager.update_status(session_id, SessionStatus::Closed);
+                    traffic_stats.record_connection_close();
+                    Ok(())
+                }
+                Err(e) => {
+                    session_manager.update_status(session_id, SessionStatus::Error(e.to_string()));
+                    traffic_stats.record_connection_close();
+                    Err(e.into())
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Application Discovery Commands
 // ============================================================================
@@ -1532,6 +1816,9 @@ pub fn run() {
         interceptor_running: false,
         ne_interceptor: None,
         ne_server_running: false,
+        pf_interceptor: None,
+        pf_interceptor_handle: None,
+        pf_interceptor_running: false,
     };
 
     let mut builder = tauri::Builder::default();
@@ -1584,6 +1871,9 @@ pub fn run() {
             start_ne_server,
             stop_ne_server,
             get_ne_status,
+            start_pf_interceptor,
+            stop_pf_interceptor,
+            get_pf_interceptor_status,
             list_installed_apps,
             export_rules_yaml,
         ])
