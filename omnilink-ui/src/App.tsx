@@ -8,11 +8,13 @@ import ProxiesView from "./components/ProxiesView";
 import SettingsView from "./components/SettingsView";
 import TrafficView from "./components/TrafficView";
 import AppsView from "./components/AppsView";
+import { useToast } from "./hooks/useToast";
 import type { AppState } from "./types";
 
 type Tab = "connections" | "rules" | "apps" | "proxies" | "traffic" | "settings";
 
 function App() {
+  const { error: showError } = useToast();
   const [activeTab, setActiveTab] = useState<Tab>("connections");
   const [appState, setAppState] = useState<AppState>({
     running: false,
@@ -59,7 +61,7 @@ function App() {
           try {
             await invoke("save_config_to", { path: filePath });
           } catch (e) {
-            console.error("Failed to save config:", e);
+            showError(`Failed to save config: ${e}`);
           }
         }
       }
@@ -79,7 +81,7 @@ function App() {
       }
       await fetchStatus();
     } catch (e) {
-      alert(`Service error: ${e}`);
+      showError(`Service error: ${e}`);
     }
   };
 

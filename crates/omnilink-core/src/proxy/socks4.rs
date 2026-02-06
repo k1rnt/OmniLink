@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use super::{ProxyDestination, ProxyError, ProxyServer};
+use super::{connect_with_timeout, ProxyDestination, ProxyError, ProxyServer, DEFAULT_CONNECT_TIMEOUT_SECS};
 
 const SOCKS4_VERSION: u8 = 0x04;
 const CMD_CONNECT: u8 = 0x01;
@@ -15,7 +15,7 @@ pub async fn connect(
     server: &ProxyServer,
     dest: &ProxyDestination,
 ) -> Result<TcpStream, ProxyError> {
-    let mut stream = TcpStream::connect(server.addr).await?;
+    let mut stream = connect_with_timeout(server.addr, DEFAULT_CONNECT_TIMEOUT_SECS).await?;
 
     let (ip, port) = match dest {
         ProxyDestination::SocketAddr(addr) => match addr {
@@ -66,7 +66,7 @@ pub async fn connect_4a(
     server: &ProxyServer,
     dest: &ProxyDestination,
 ) -> Result<TcpStream, ProxyError> {
-    let mut stream = TcpStream::connect(server.addr).await?;
+    let mut stream = connect_with_timeout(server.addr, DEFAULT_CONNECT_TIMEOUT_SECS).await?;
 
     let (ip_bytes, port, domain_bytes) = match dest {
         ProxyDestination::SocketAddr(addr) => match addr {

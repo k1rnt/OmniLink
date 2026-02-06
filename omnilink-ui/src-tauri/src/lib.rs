@@ -14,11 +14,18 @@ use omnilink_core::session::SessionManager;
 use omnilink_core::stats::TrafficStats;
 use omnilink_core::sysproxy::SysProxyConfig;
 
-/// Write config to disk (best-effort, errors silently ignored).
+/// Write config to disk (best-effort, errors logged).
 fn auto_save(state: &AppStateInner) {
     if let Some(config) = &state.config {
-        if let Ok(yaml) = serde_yaml::to_string(config) {
-            let _ = std::fs::write(&state.config_path, &yaml);
+        match serde_yaml::to_string(config) {
+            Ok(yaml) => {
+                if let Err(e) = std::fs::write(&state.config_path, &yaml) {
+                    tracing::warn!(path = %state.config_path.display(), error = %e, "failed to auto-save config");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize config for auto-save");
+            }
         }
     }
 }
@@ -225,6 +232,9 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
         }
     });
 
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+
+    let listen_addr_display = config.general.listen_addr.clone();
     let handle = tokio::spawn(async move {
         if let Err(e) = run_service(
             &listen_addr,
@@ -234,6 +244,7 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
             session_manager,
             traffic_stats,
             connection_handles,
+            startup_tx,
         )
         .await
         {
@@ -241,10 +252,24 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
         }
     });
 
-    state_guard.running = true;
-    state_guard.service_handle = Some(handle);
+    // Drop the lock before awaiting startup, then re-acquire
+    drop(state_guard);
 
-    Ok(format!("Service started on {}", config.general.listen_addr))
+    // Wait for listener bind result
+    let bind_result = startup_rx.await.unwrap_or(Err("Service task exited unexpectedly".to_string()));
+    let mut state_guard = state.lock().await;
+
+    match bind_result {
+        Ok(()) => {
+            state_guard.running = true;
+            state_guard.service_handle = Some(handle);
+            Ok(format!("Service started on {}", listen_addr_display))
+        }
+        Err(e) => {
+            handle.abort();
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -392,6 +417,13 @@ fn parse_action(action: &str, proxy_name: Option<&str>) -> Action {
 
 #[tauri::command]
 async fn add_rule(state: State<'_, SharedState>, req: AddRuleRequest) -> Result<String, String> {
+    if req.name.trim().is_empty() {
+        return Err("Rule name cannot be empty".to_string());
+    }
+    if req.conditions.is_empty() {
+        return Err("Rule must have at least one condition".to_string());
+    }
+
     let mut state = state.lock().await;
     let (rules_snapshot, default_action) = {
         let config = state.config.as_mut().ok_or("No configuration loaded")?;
@@ -409,7 +441,7 @@ async fn add_rule(state: State<'_, SharedState>, req: AddRuleRequest) -> Result<
 
     // Sync to running rule engine
     if let Some(re) = &state.rule_engine {
-        *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
+        *re.write().unwrap_or_else(|e| e.into_inner()) = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
 
     auto_save(&state);
@@ -429,7 +461,7 @@ async fn toggle_rule(state: State<'_, SharedState>, index: usize) -> Result<Stri
 
     // Sync to running rule engine
     if let Some(re) = &state.rule_engine {
-        *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
+        *re.write().unwrap_or_else(|e| e.into_inner()) = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
 
     auto_save(&state);
@@ -451,7 +483,7 @@ async fn delete_rule(state: State<'_, SharedState>, index: usize) -> Result<Stri
 
     // Sync to running rule engine
     if let Some(re) = &state.rule_engine {
-        *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
+        *re.write().unwrap_or_else(|e| e.into_inner()) = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
 
     auto_save(&state);
@@ -472,8 +504,22 @@ pub struct AddProxyRequest {
 
 #[tauri::command]
 async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Result<String, String> {
+    if req.name.trim().is_empty() {
+        return Err("Proxy name cannot be empty".to_string());
+    }
+    if req.address.trim().is_empty() {
+        return Err("Proxy address cannot be empty".to_string());
+    }
+    if req.port == 0 {
+        return Err("Port must be between 1 and 65535".to_string());
+    }
+
     let mut state = state.lock().await;
     let config = state.config.as_mut().ok_or("No configuration loaded")?;
+
+    if config.proxies.iter().any(|p| p.name == req.name) {
+        return Err(format!("Proxy '{}' already exists", req.name));
+    }
 
     let protocol = match req.protocol.to_lowercase().as_str() {
         "socks4" => omnilink_core::proxy::ProxyProtocol::Socks4,
@@ -567,8 +613,22 @@ pub struct AddChainRequest {
 
 #[tauri::command]
 async fn add_chain(state: State<'_, SharedState>, req: AddChainRequest) -> Result<String, String> {
+    if req.name.trim().is_empty() {
+        return Err("Chain name cannot be empty".to_string());
+    }
+    if req.proxies.is_empty() {
+        return Err("Chain must contain at least one proxy".to_string());
+    }
+
     let mut state = state.lock().await;
     let config = state.config.as_mut().ok_or("No configuration loaded")?;
+
+    // Validate that all referenced proxies exist
+    for proxy_name in &req.proxies {
+        if !config.proxies.iter().any(|p| &p.name == proxy_name) {
+            return Err(format!("Proxy '{}' not found", proxy_name));
+        }
+    }
 
     let mode = match req.mode.to_lowercase().as_str() {
         "failover" => omnilink_core::config::ChainMode::Failover,
@@ -948,8 +1008,18 @@ async fn run_service(
     session_manager: Arc<SessionManager>,
     traffic_stats: Arc<TrafficStats>,
     connection_handles: Arc<tokio::sync::Mutex<HashMap<u64, tokio_util::sync::CancellationToken>>>,
+    startup_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(l) => {
+            let _ = startup_tx.send(Ok(()));
+            l
+        }
+        Err(e) => {
+            let _ = startup_tx.send(Err(format!("Failed to bind {}: {}", listen_addr, e)));
+            return Err(e.into());
+        }
+    };
     tracing::info!(addr = %listen_addr, "tauri service listening");
 
     loop {
@@ -1118,7 +1188,7 @@ async fn handle_connection(
         dest_port: port,
     };
 
-    let action = rule_engine.read().unwrap().evaluate(&ctx);
+    let action = rule_engine.read().unwrap_or_else(|e| e.into_inner()).evaluate(&ctx);
     tracing::info!(dest = %dest, process = ?process_name, action = ?action, "routing decision");
 
     let proxy_name = match &action {
@@ -1287,12 +1357,19 @@ async fn start_ne_server(state: State<'_, SharedState>) -> Result<String, String
     let virtual_dns = state_guard.virtual_dns.clone();
     let session_manager = state_guard.session_manager.clone();
 
+    // Use app data dir for socket path to avoid permission issues
+    let socket_path = state_guard.config_path.parent()
+        .unwrap_or(std::path::Path::new("/tmp"))
+        .join("omnilink.sock");
+    let socket_path_str = socket_path.display().to_string();
+
     // Create and start the NE interceptor
     let mut ne_interceptor = omnilink_tun::create_ne_interceptor(
         rule_engine,
         chain_relay,
         virtual_dns,
         session_manager,
+        Some(&socket_path_str),
     );
 
     let _event_rx = ne_interceptor
@@ -1304,9 +1381,9 @@ async fn start_ne_server(state: State<'_, SharedState>) -> Result<String, String
     state_guard.ne_interceptor = Some(ne_interceptor);
     state_guard.ne_server_running = true;
 
-    tracing::info!("NE socket server started");
+    tracing::info!(path = %socket_path_str, "NE socket server started");
 
-    Ok("NE socket server started at /var/run/omnilink.sock".to_string())
+    Ok(format!("NE socket server started at {}", socket_path_str))
 }
 
 #[cfg(not(target_os = "macos"))]

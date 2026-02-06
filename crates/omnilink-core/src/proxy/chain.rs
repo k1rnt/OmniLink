@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::TcpStream;
 
-use super::{ProxyDestination, ProxyError, ProxyProtocol, ProxyServer};
+use super::{connect_with_timeout, ProxyDestination, ProxyError, ProxyProtocol, ProxyServer, DEFAULT_CONNECT_TIMEOUT_SECS};
 use crate::config::{ChainConfig, ChainMode};
 
 /// Relay that connects through a proxy chain or selects a proxy based on chain mode.
@@ -85,7 +85,7 @@ impl ChainRelay {
 
         // Connect to the first proxy directly
         let first_server = self.get_proxy(&chain.proxies[0])?;
-        let mut stream = TcpStream::connect(first_server.addr).await?;
+        let mut stream = connect_with_timeout(first_server.addr, DEFAULT_CONNECT_TIMEOUT_SECS).await?;
 
         // For each intermediate proxy, establish a tunnel through the current connection
         // to the next proxy's address

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useToast } from "../hooks/useToast";
 
 interface ProxyInfo {
   name: string;
@@ -46,6 +47,7 @@ const emptyChainForm: AddChainForm = {
 };
 
 function ProxiesView() {
+  const { error: showError } = useToast();
   const [proxies, setProxies] = useState<ProxyInfo[]>([]);
   const [chains, setChains] = useState<ChainInfo[]>([]);
   const [showProxyForm, setShowProxyForm] = useState(false);
@@ -62,7 +64,7 @@ function ProxiesView() {
       setProxies(p);
       setChains(c);
     } catch (e) {
-      console.error("Failed to fetch proxy data:", e);
+      showError(`Failed to fetch proxy data: ${e}`);
     }
   }, []);
 
@@ -87,7 +89,7 @@ function ProxiesView() {
       setShowProxyForm(false);
       await fetchData();
     } catch (e) {
-      console.error("Failed to add proxy:", e);
+      showError(`Failed to add proxy: ${e}`);
     }
   };
 
@@ -96,7 +98,7 @@ function ProxiesView() {
       await invoke("delete_proxy", { name });
       await fetchData();
     } catch (e) {
-      console.error("Failed to delete proxy:", e);
+      showError(`Failed to delete proxy: ${e}`);
     }
   };
 
@@ -114,7 +116,7 @@ function ProxiesView() {
       setShowChainForm(false);
       await fetchData();
     } catch (e) {
-      console.error("Failed to add chain:", e);
+      showError(`Failed to add chain: ${e}`);
     }
   };
 
@@ -123,7 +125,7 @@ function ProxiesView() {
       await invoke("delete_chain", { name });
       await fetchData();
     } catch (e) {
-      console.error("Failed to delete chain:", e);
+      showError(`Failed to delete chain: ${e}`);
     }
   };
 

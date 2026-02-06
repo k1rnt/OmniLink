@@ -1,7 +1,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use super::{ProxyAuth, ProxyDestination, ProxyError, ProxyServer};
+use super::{connect_with_timeout, ProxyAuth, ProxyDestination, ProxyError, ProxyServer, DEFAULT_CONNECT_TIMEOUT_SECS};
 
 // SOCKS5 constants
 const SOCKS5_VERSION: u8 = 0x05;
@@ -21,7 +21,7 @@ pub async fn connect(
     server: &ProxyServer,
     dest: &ProxyDestination,
 ) -> Result<TcpStream, ProxyError> {
-    let mut stream = TcpStream::connect(server.addr).await?;
+    let mut stream = connect_with_timeout(server.addr, DEFAULT_CONNECT_TIMEOUT_SECS).await?;
 
     // --- Phase 1: Authentication negotiation ---
     negotiate_auth(&mut stream, &server.auth).await?;
@@ -112,7 +112,7 @@ pub async fn udp_associate(
     server: &ProxyServer,
     client_addr: std::net::SocketAddr,
 ) -> Result<UdpAssociation, ProxyError> {
-    let mut stream = TcpStream::connect(server.addr).await?;
+    let mut stream = connect_with_timeout(server.addr, DEFAULT_CONNECT_TIMEOUT_SECS).await?;
 
     negotiate_auth(&mut stream, &server.auth).await?;
 

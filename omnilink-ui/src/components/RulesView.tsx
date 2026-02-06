@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useToast } from "../hooks/useToast";
 import type { ApplicationInfo } from "../types";
 
 interface RuleInfo {
@@ -30,6 +31,7 @@ const emptyForm: AddRuleForm = {
 };
 
 function RulesView() {
+  const { success, error: showError, warning } = useToast();
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<AddRuleForm>(emptyForm);
@@ -55,7 +57,7 @@ function RulesView() {
       await invoke("toggle_rule", { index });
       await fetchRules();
     } catch (e) {
-      alert(`Failed to toggle rule: ${e}`);
+      showError(`Failed to toggle rule: ${e}`);
     }
   };
 
@@ -64,17 +66,17 @@ function RulesView() {
       await invoke("delete_rule", { index });
       await fetchRules();
     } catch (e) {
-      alert(`Failed to delete rule: ${e}`);
+      showError(`Failed to delete rule: ${e}`);
     }
   };
 
   const handleAdd = async () => {
     if (!form.name) {
-      alert("Please enter a rule name");
+      warning("Please enter a rule name");
       return;
     }
     if (!form.conditionValue) {
-      alert("Please enter a condition value");
+      warning("Please enter a condition value");
       return;
     }
 
@@ -99,7 +101,7 @@ function RulesView() {
       setShowForm(false);
       await fetchRules();
     } catch (e) {
-      alert(`Failed to add rule: ${e}`);
+      showError(`Failed to add rule: ${e}`);
     }
   };
 
@@ -107,10 +109,9 @@ function RulesView() {
     try {
       const yaml = await invoke<string>("export_rules_yaml");
       await navigator.clipboard.writeText(yaml);
-      alert("Rules exported to clipboard as YAML");
+      success("Rules exported to clipboard as YAML");
     } catch (e) {
-      console.error("Failed to export rules:", e);
-      alert(`Export failed: ${e}`);
+      showError(`Export failed: ${e}`);
     }
   };
 
@@ -121,7 +122,7 @@ function RulesView() {
       setShowAppSelector(true);
       setAppSearchQuery("");
     } catch (e) {
-      console.error("Failed to load apps:", e);
+      showError(`Failed to load apps: ${e}`);
     }
   };
 

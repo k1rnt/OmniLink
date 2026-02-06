@@ -1,7 +1,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use super::{ProxyDestination, ProxyError, ProxyServer};
+use super::{connect_with_timeout, ProxyDestination, ProxyError, ProxyServer, DEFAULT_CONNECT_TIMEOUT_SECS};
 
 /// Establishes an HTTP CONNECT tunnel through the given proxy server.
 /// Returns the connected TcpStream ready for data transfer.
@@ -9,7 +9,7 @@ pub async fn connect(
     server: &ProxyServer,
     dest: &ProxyDestination,
 ) -> Result<TcpStream, ProxyError> {
-    let mut stream = TcpStream::connect(server.addr).await?;
+    let mut stream = connect_with_timeout(server.addr, DEFAULT_CONNECT_TIMEOUT_SECS).await?;
 
     let target = match dest {
         ProxyDestination::SocketAddr(addr) => addr.to_string(),

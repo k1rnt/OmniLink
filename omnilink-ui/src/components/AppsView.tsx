@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useToast } from "../hooks/useToast";
 import type { ApplicationInfo, ProxyServer } from "../types";
 
 interface AppRuleConfig {
@@ -8,6 +9,7 @@ interface AppRuleConfig {
 }
 
 export default function AppsView() {
+  const { success, error: showError } = useToast();
   const [apps, setApps] = useState<ApplicationInfo[]>([]);
   const [proxies, setProxies] = useState<ProxyServer[]>([]);
   const [loading, setLoading] = useState(true);
@@ -21,7 +23,7 @@ export default function AppsView() {
       const result = await invoke<ApplicationInfo[]>("list_installed_apps");
       setApps(result);
     } catch (e) {
-      console.error("Failed to fetch apps:", e);
+      showError(`Failed to fetch apps: ${e}`);
     } finally {
       setLoading(false);
     }
@@ -32,7 +34,7 @@ export default function AppsView() {
       const result = await invoke<ProxyServer[]>("get_proxies");
       setProxies(result);
     } catch (e) {
-      console.error("Failed to fetch proxies:", e);
+      showError(`Failed to fetch proxies: ${e}`);
     }
   }, []);
 
@@ -65,10 +67,9 @@ export default function AppsView() {
       };
       await invoke("add_rule", { req });
       setSelectedApp(null);
-      alert(`Rule created for ${selectedApp.name}`);
+      success(`Rule created for ${selectedApp.name}`);
     } catch (e) {
-      console.error("Failed to create rule:", e);
-      alert(`Failed to create rule: ${e}`);
+      showError(`Failed to create rule: ${e}`);
     }
   };
 

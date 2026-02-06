@@ -21,6 +21,25 @@ pub enum ProxyError {
     UnsupportedCommand(u8),
     #[error("address type not supported")]
     AddressTypeNotSupported,
+    #[error("connection timed out after {0}s")]
+    ConnectionTimeout(u64),
+}
+
+/// Default connect timeout in seconds.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Connect to a socket address with timeout.
+pub async fn connect_with_timeout(
+    addr: SocketAddr,
+    timeout_secs: u64,
+) -> Result<tokio::net::TcpStream, ProxyError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| ProxyError::ConnectionTimeout(timeout_secs))?
+    .map_err(ProxyError::Io)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

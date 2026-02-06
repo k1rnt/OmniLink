@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useToast } from "../hooks/useToast";
 import type { Session } from "../types";
 
 type FilterMode = "all" | "active" | "closed";
@@ -41,6 +42,7 @@ interface ContextMenuState {
 }
 
 function ConnectionsView() {
+  const { error: showError } = useToast();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [filter, setFilter] = useState<FilterMode>("all");
   const [searchQuery, setSearchQuery] = useState("");
@@ -55,7 +57,7 @@ function ConnectionsView() {
       const data = await invoke<Session[]>("get_sessions");
       setSessions(data);
     } catch (e) {
-      console.error("Failed to fetch sessions:", e);
+      showError(`Failed to fetch sessions: ${e}`);
     }
   }, []);
 
@@ -111,7 +113,7 @@ function ConnectionsView() {
           },
         });
       } catch (e) {
-        console.error("Failed to create rule:", e);
+        showError(`Failed to create rule: ${e}`);
       }
     }
     closeContextMenu();
@@ -122,7 +124,7 @@ function ConnectionsView() {
       try {
         await invoke("terminate_session", { sessionId: contextMenu.session.id });
       } catch (e) {
-        console.error("Failed to terminate session:", e);
+        showError(`Failed to terminate session: ${e}`);
       }
     }
     closeContextMenu();
@@ -140,7 +142,7 @@ function ConnectionsView() {
       await invoke("clear_closed_sessions");
       await fetchSessions();
     } catch (e) {
-      console.error("Failed to clear sessions:", e);
+      showError(`Failed to clear sessions: ${e}`);
     }
   }, [fetchSessions]);
 

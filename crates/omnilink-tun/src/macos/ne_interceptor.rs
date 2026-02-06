@@ -26,7 +26,7 @@ use omnilink_core::session::SessionManager;
 use crate::interceptor::{Interceptor, InterceptorError, InterceptorEvent};
 
 /// Default socket path for IPC with the Network Extension.
-const SOCKET_PATH: &str = "/var/run/omnilink.sock";
+const SOCKET_PATH: &str = "/tmp/omnilink.sock";
 
 /// Request messages from the Network Extension (Swift) to the Rust backend.
 #[derive(Debug, Serialize, Deserialize)]

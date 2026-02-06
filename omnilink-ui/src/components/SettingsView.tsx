@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useUpdater } from "../hooks/useUpdater";
+import { useToast } from "../hooks/useToast";
 import type { AppState } from "../types";
 
 interface ProfileInfo {
@@ -31,8 +32,8 @@ function formatBytes(bytes: number): string {
 }
 
 function SettingsView({ state }: Props) {
+  const { success, error: showError } = useToast();
   const [sysproxyEnabled, setSysproxyEnabled] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [newProfileName, setNewProfileName] = useState("");
   const [appVersion, setAppVersion] = useState("");
@@ -79,8 +80,11 @@ function SettingsView({ state }: Props) {
   }, [fetchSysproxy, fetchProfiles, fetchNeStatus]);
 
   const showMessage = (msg: string) => {
-    setMessage(msg);
-    setTimeout(() => setMessage(null), 3000);
+    if (msg.toLowerCase().startsWith("error")) {
+      showError(msg);
+    } else {
+      success(msg);
+    }
   };
 
   const handleToggleSysproxy = async () => {
@@ -132,21 +136,6 @@ function SettingsView({ state }: Props) {
 
   return (
     <div className="settings-panel">
-      {message && (
-        <div
-          style={{
-            padding: "8px 12px",
-            background: "var(--bg-tertiary)",
-            border: "1px solid var(--border)",
-            borderRadius: 4,
-            marginBottom: 12,
-            fontSize: 12,
-          }}
-        >
-          {message}
-        </div>
-      )}
-
       <div className="setting-group">
         <h3>Updates</h3>
         <div className="setting-row">

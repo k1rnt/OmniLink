@@ -28,20 +28,25 @@ pub fn create_interceptor(
 /// Create a Network Extension interceptor for macOS.
 ///
 /// This interceptor communicates with the NETransparentProxyProvider system extension
-/// via a Unix domain socket at `/var/run/omnilink.sock`.
+/// via a Unix domain socket. If `socket_path` is provided, it overrides the default path.
 #[cfg(target_os = "macos")]
 pub fn create_ne_interceptor(
     rule_engine: std::sync::Arc<omnilink_core::rule::RuleEngine>,
     chain_relay: std::sync::Arc<omnilink_core::proxy::chain::ChainRelay>,
     virtual_dns: std::sync::Arc<omnilink_core::dns::VirtualDns>,
     session_manager: std::sync::Arc<omnilink_core::session::SessionManager>,
+    socket_path: Option<&str>,
 ) -> Box<dyn interceptor::Interceptor> {
-    Box::new(macos::ne_interceptor::NEInterceptor::new(
+    let mut interceptor = macos::ne_interceptor::NEInterceptor::new(
         rule_engine,
         chain_relay,
         virtual_dns,
         session_manager,
-    ))
+    );
+    if let Some(path) = socket_path {
+        interceptor = interceptor.with_socket_path(path);
+    }
+    Box::new(interceptor)
 }
 
 #[cfg(target_os = "linux")]
