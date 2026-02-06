@@ -228,6 +228,25 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
+      - name: Rename updater artifacts to avoid name conflicts
+        run: |
+          # macOS tar.gz files have the same name, rename with arch suffix
+          AARCH64_TAR=$(find artifacts/OmniLink-aarch64-apple-darwin -name "*.app.tar.gz" ! -name "*.sig" | head -1)
+          AARCH64_SIG=$(find artifacts/OmniLink-aarch64-apple-darwin -name "*.app.tar.gz.sig" | head -1)
+          if [ -n "$AARCH64_TAR" ]; then
+            mv "$AARCH64_TAR" "$(dirname "$AARCH64_TAR")/OmniLink_aarch64.app.tar.gz"
+            mv "$AARCH64_SIG" "$(dirname "$AARCH64_SIG")/OmniLink_aarch64.app.tar.gz.sig"
+          fi
+
+          X86_TAR=$(find artifacts/OmniLink-x86_64-apple-darwin -name "*.app.tar.gz" ! -name "*.sig" | head -1)
+          X86_SIG=$(find artifacts/OmniLink-x86_64-apple-darwin -name "*.app.tar.gz.sig" | head -1)
+          if [ -n "$X86_TAR" ]; then
+            mv "$X86_TAR" "$(dirname "$X86_TAR")/OmniLink_x86_64.app.tar.gz"
+            mv "$X86_SIG" "$(dirname "$X86_SIG")/OmniLink_x86_64.app.tar.gz.sig"
+          fi
+
+          ls -R artifacts/
+
       - name: Generate latest.json for updater
         run: |
           VERSION="${{ steps.version.outputs.version }}"
@@ -239,7 +258,7 @@ jobs:
           LINUX_SIG=$(find artifacts/OmniLink-linux -name "*.AppImage.tar.gz.sig" | head -1 | xargs cat 2>/dev/null || echo "")
           WINDOWS_SIG=$(find artifacts/OmniLink-windows -name "*.exe.sig" | head -1 | xargs cat 2>/dev/null || echo "")
 
-          # Find updater artifact filenames
+          # Find updater artifact filenames (after rename)
           DARWIN_AARCH64_FILE=$(find artifacts/OmniLink-aarch64-apple-darwin -name "*.tar.gz" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
           DARWIN_X86_64_FILE=$(find artifacts/OmniLink-x86_64-apple-darwin -name "*.tar.gz" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
           LINUX_FILE=$(find artifacts/OmniLink-linux -name "*.AppImage.tar.gz" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
@@ -285,7 +304,7 @@ jobs:
             artifacts/OmniLink-x86_64-apple-darwin/**/*.tar.gz
             artifacts/OmniLink-linux/**/*.deb
             artifacts/OmniLink-linux/**/*.AppImage
-            artifacts/OmniLink-linux/**/*.AppImage.tar.gz
+            artifacts/OmniLink-linux/**/*.tar.gz
             artifacts/OmniLink-windows/**/*.msi
             artifacts/OmniLink-windows/**/*.exe
             artifacts/OmniLink-windows/**/*.exe.sig
