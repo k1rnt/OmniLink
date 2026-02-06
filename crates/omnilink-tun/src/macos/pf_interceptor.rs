@@ -75,12 +75,12 @@ impl Interceptor for PfInterceptor {
         self.listener_port = local_addr.port();
         tracing::info!(port = self.listener_port, "pf TCP listener bound");
 
-        // 3. Open /dev/pf via privileged helper
+        // 3. Install pf anchor rules (also makes /dev/pf readable for DIOCNATLOOK)
+        install_pf_rules(&iface, self.listener_port, self.self_uid, &self.excluded_ips)?;
+
+        // 4. Open /dev/pf (after install_pf_rules which chmod's it)
         let pf_fd = open_pf_dev()?;
         self.pf_fd = Some(pf_fd);
-
-        // 4. Install pf anchor rules
-        install_pf_rules(&iface, self.listener_port, self.self_uid, &self.excluded_ips)?;
 
         // 5. Spawn accept loop
         let (tx, rx) = mpsc::channel(256);
@@ -135,36 +135,28 @@ fn detect_active_interface() -> Option<String> {
     None
 }
 
-/// Open /dev/pf with admin privileges. Returns the file descriptor.
+/// Open /dev/pf for DIOCNATLOOK ioctl.
 ///
-/// We use a small privileged helper script that opens /dev/pf and writes
-/// the fd number. Since we can't pass fds across process boundaries easily,
-/// we instead open /dev/pf directly and rely on the pf rules being installed
-/// with admin privileges separately.
+/// Called AFTER `install_pf_rules` which `chmod o+r /dev/pf` with admin privileges.
+/// Returns -1 as sentinel if /dev/pf cannot be opened (fallback to pfctl -s state).
 fn open_pf_dev() -> Result<RawFd, InterceptorError> {
+    // Try read-write first (needed for DIOCNATLOOK on some macOS versions)
     let fd = unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::O_RDWR) };
     if fd >= 0 {
+        tracing::info!("/dev/pf opened (rw)");
         return Ok(fd);
     }
 
-    // /dev/pf requires root. Try via privileged helper that changes permissions.
-    tracing::info!("/dev/pf not accessible directly, requesting admin privileges");
-
-    // Create a small helper: open /dev/pf with correct permissions for our process.
-    // We use a temporary approach: chmod /dev/pf temporarily, open it, then restore.
-    // A safer approach: use a privileged helper binary, but for now we just note
-    // that pfctl commands themselves will be run with admin privileges.
-
-    // Try again after pfctl -e (which may adjust /dev/pf permissions)
+    // Try read-only
     let fd =
         unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::O_RDONLY) };
     if fd >= 0 {
+        tracing::info!("/dev/pf opened (ro)");
         return Ok(fd);
     }
 
-    // As fallback, we'll rely on pfctl -s state parsing instead of DIOCNATLOOK
     tracing::warn!("could not open /dev/pf, will use pfctl -s state fallback for NAT lookup");
-    Ok(-1) // sentinel: DIOCNATLOOK won't work, fallback will be used
+    Ok(-1)
 }
 
 /// Install pf anchor rules for transparent TCP redirection.
@@ -239,7 +231,8 @@ fn install_pf_rules(
          grep '^load' /etc/pf.conf 2>/dev/null; \
          true; }} > /tmp/omnilink_pf_main.conf && \
          pfctl -f /tmp/omnilink_pf_main.conf 2>&1 && \
-         pfctl -e 2>&1; \
+         pfctl -e 2>&1 && \
+         chmod o+rw /dev/pf 2>&1; \
          rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf",
         rules_escaped,
         ANCHOR_NAME,
@@ -263,7 +256,7 @@ fn install_pf_rules(
 /// 2. Reload `/etc/pf.conf` into the main ruleset to remove our anchor references.
 fn flush_pf_rules() {
     let cmd = format!(
-        "pfctl -a {} -F all 2>&1; pfctl -f /etc/pf.conf 2>&1 || true",
+        "pfctl -a {} -F all 2>&1; pfctl -f /etc/pf.conf 2>&1; chmod 600 /dev/pf 2>&1 || true",
         ANCHOR_NAME,
     );
     match privilege::run_with_admin_privileges(&cmd) {
@@ -390,6 +383,9 @@ fn lookup_original_dst_ioctl(
 }
 
 /// Fallback: look up original destination by parsing `pfctl -s state` output.
+///
+/// Note: Does NOT use admin privilege escalation — that would trigger a password
+/// dialog for every connection. If pfctl fails without root, returns None.
 fn lookup_original_dst_pfctl(peer_addr: &SocketAddr) -> Option<SocketAddr> {
     let output = std::process::Command::new("pfctl")
         .args(["-s", "state"])
@@ -397,10 +393,7 @@ fn lookup_original_dst_pfctl(peer_addr: &SocketAddr) -> Option<SocketAddr> {
         .ok()?;
 
     if !output.status.success() {
-        // May need sudo - try with osascript
-        let output_str =
-            privilege::run_with_admin_privileges("pfctl -s state 2>/dev/null").ok()?;
-        return parse_pf_state(&output_str, peer_addr);
+        return None;
     }
 
     let state_text = String::from_utf8_lossy(&output.stdout);
