@@ -247,6 +247,21 @@ async fn stop_service(state: State<'_, SharedState>) -> Result<String, String> {
         handle.abort();
     }
 
+    // Auto-disable system proxy so traffic isn't blocked
+    if state_guard.sysproxy_enabled {
+        if let Some(config) = state_guard.config.as_ref() {
+            let listen = &config.general.listen_addr;
+            let parts: Vec<&str> = listen.split(':').collect();
+            let host = parts.first().copied().unwrap_or("127.0.0.1");
+            let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1080);
+            let sysproxy = SysProxyConfig::new(host, port);
+            if let Err(e) = sysproxy.disable() {
+                tracing::warn!(error = %e, "failed to disable system proxy on stop");
+            }
+            state_guard.sysproxy_enabled = false;
+        }
+    }
+
     state_guard.running = false;
     Ok("Service stopped".to_string())
 }
