@@ -1084,17 +1084,24 @@ async fn handle_connection(
     };
 
     // Look up the originating process from the SOCKS5 client's source port.
-    // Use a timeout to avoid blocking when the system is under heavy load.
-    let proc_info = tokio::time::timeout(
-        tokio::time::Duration::from_millis(200),
+    let proc_info = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
         tokio::task::spawn_blocking(move || {
             omnilink_tun::process::lookup_process_by_socket(&peer_addr)
         }),
     )
     .await
-    .ok()
-    .and_then(|r| r.ok())
-    .flatten();
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "process lookup task failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer_addr, "process lookup timed out (2s)");
+            None
+        }
+    };
 
     let process_name = proc_info.as_ref().map(|p| p.name.clone());
     let process_path = proc_info.as_ref().map(|p| p.path.clone());

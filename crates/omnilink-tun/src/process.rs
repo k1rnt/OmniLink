@@ -407,7 +407,14 @@ mod macos {
     pub(super) fn lookup(local_addr: &SocketAddr) -> Option<ProcessInfo> {
         let target = match local_addr {
             SocketAddr::V4(v4) => *v4,
-            SocketAddr::V6(_) => return None, // TODO: IPv6 support
+            SocketAddr::V6(v6) => {
+                // Handle IPv4-mapped IPv6 addresses (::ffff:127.0.0.1)
+                if let Some(ipv4) = v6.ip().to_ipv4_mapped() {
+                    SocketAddrV4::new(ipv4, v6.port())
+                } else {
+                    return None;
+                }
+            }
         };
 
         let pids = list_all_pids()?;
