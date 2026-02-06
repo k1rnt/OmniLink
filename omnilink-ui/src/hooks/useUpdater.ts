@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 
@@ -52,8 +52,10 @@ export function useUpdater() {
 
       setProgress({ status: 'idle', downloadedBytes: 0, totalBytes: 0 });
     } catch (e) {
-      console.warn("Update check failed:", e);
-      setProgress({ status: 'idle', downloadedBytes: 0, totalBytes: 0 });
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn("Update check failed:", msg);
+      setError(msg);
+      setProgress({ status: 'error', downloadedBytes: 0, totalBytes: 0 });
     }
   }, []);
 
@@ -93,15 +95,6 @@ export function useUpdater() {
   const restartApp = useCallback(async () => {
     await relaunch();
   }, []);
-
-  // Check for updates on mount
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      checkForUpdates();
-    }, 3000);
-
-    return () => clearTimeout(timer);
-  }, [checkForUpdates]);
 
   return {
     updateInfo,
