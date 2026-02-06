@@ -186,6 +186,16 @@ fn install_pf_rules(
 ) -> Result<(), InterceptorError> {
     let mut rules = String::new();
 
+    // pf requires rules in order: translation (rdr/nat) THEN filter (pass/block).
+
+    // --- Translation rules (rdr) ---
+    // Redirect traffic arriving on lo0 (via route-to) to our listener
+    rules.push_str(&format!(
+        "rdr pass on lo0 proto tcp from any to any -> 127.0.0.1 port {}\n",
+        listener_port
+    ));
+
+    // --- Filter rules (pass) ---
     // Exclude proxy server IPs to prevent loops
     for ip in excluded_ips {
         rules.push_str(&format!(
@@ -200,24 +210,38 @@ fn install_pf_rules(
         iface
     ));
 
-    // Redirect outbound TCP from non-self users through lo0 to our listener
-    rules.push_str(&format!(
-        "rdr pass on lo0 proto tcp from any to any -> 127.0.0.1 port {}\n",
-        listener_port
-    ));
+    // Route outbound TCP from non-self users through lo0
     rules.push_str(&format!(
         "pass out on {} route-to lo0 inet proto tcp from any to any user != {} keep state\n",
         iface, self_uid
     ));
 
-    // Step 1: Load anchor rules
-    // Step 2: Add anchor references to the main ruleset (append to /etc/pf.conf content)
+    // Escape newlines for printf (osascript cannot handle literal newlines in
+    // the AppleScript string — they break the `do shell script "…"` parsing).
+    let rules_escaped = rules.replace('\'', "'\\''").replace('\n', "\\n");
+
+    // Step 1: Write anchor rules to temp file via printf, load with pfctl -a
+    // Step 2: Rebuild main ruleset from /etc/pf.conf with our anchor references
+    //         inserted at the correct positions (pf requires strict ordering:
+    //         scrub → nat → rdr → dummynet → filter → load).
     // Step 3: Enable pf
+    // Step 4: Clean up temp files
     let cmd = format!(
-        "echo '{}' | pfctl -a {} -f - 2>&1 && \
-         {{ cat /etc/pf.conf; echo 'rdr-anchor \"{}\"'; echo 'anchor \"{}\"'; }} | pfctl -f - 2>&1 && \
-         pfctl -e 2>&1 || true",
-        rules.replace('\'', "'\\''"),
+        "printf '{}' > /tmp/omnilink_pf_anchor.conf && \
+         pfctl -a {} -f /tmp/omnilink_pf_anchor.conf 2>&1 && \
+         {{ grep '^scrub-anchor' /etc/pf.conf 2>/dev/null; \
+         grep '^nat-anchor' /etc/pf.conf 2>/dev/null; \
+         grep '^rdr-anchor' /etc/pf.conf 2>/dev/null; \
+         echo 'rdr-anchor \"{}\"'; \
+         grep '^dummynet-anchor' /etc/pf.conf 2>/dev/null; \
+         grep '^anchor' /etc/pf.conf 2>/dev/null; \
+         echo 'anchor \"{}\"'; \
+         grep '^load' /etc/pf.conf 2>/dev/null; \
+         true; }} > /tmp/omnilink_pf_main.conf && \
+         pfctl -f /tmp/omnilink_pf_main.conf 2>&1 && \
+         pfctl -e 2>&1; \
+         rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf",
+        rules_escaped,
         ANCHOR_NAME,
         ANCHOR_NAME,
         ANCHOR_NAME,
