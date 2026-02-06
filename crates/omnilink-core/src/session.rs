@@ -91,6 +91,13 @@ impl SessionManager {
         }
     }
 
+    pub fn set_process_name(&self, id: u64, name: Option<String>, path: Option<String>) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(&id) {
+            session.process_name = name;
+            let _ = path; // reserved for future use
+        }
+    }
+
     pub fn update_bytes(&self, id: u64, sent: u64, received: u64) {
         if let Some(session) = self.sessions.lock().unwrap().get_mut(&id) {
             session.bytes_sent += sent;
@@ -99,10 +106,24 @@ impl SessionManager {
     }
 
     pub fn get_sessions(&self) -> Vec<Session> {
-        let mut sessions: Vec<Session> = self
-            .sessions
-            .lock()
-            .unwrap()
+        let mut sessions = self.sessions.lock().unwrap();
+
+        // Auto-cleanup: remove oldest closed sessions when exceeding limit
+        let total = sessions.len();
+        if total > self.max_history {
+            let mut closed_ids: Vec<u64> = sessions
+                .iter()
+                .filter(|(_, s)| matches!(s.status, SessionStatus::Closed | SessionStatus::Error(_)))
+                .map(|(id, _)| *id)
+                .collect();
+            closed_ids.sort(); // ascending by ID (oldest first)
+            let to_remove = total - self.max_history;
+            for id in closed_ids.into_iter().take(to_remove) {
+                sessions.remove(&id);
+            }
+        }
+
+        let mut result: Vec<Session> = sessions
             .values()
             .map(|s| {
                 let mut s = s.clone();
@@ -110,8 +131,8 @@ impl SessionManager {
                 s
             })
             .collect();
-        sessions.sort_by(|a, b| b.id.cmp(&a.id));
-        sessions
+        result.sort_by(|a, b| b.id.cmp(&a.id));
+        result
     }
 
     pub fn get_active_sessions(&self) -> Vec<Session> {
@@ -119,6 +140,12 @@ impl SessionManager {
             .into_iter()
             .filter(|s| matches!(s.status, SessionStatus::Connecting | SessionStatus::Active))
             .collect()
+    }
+
+    /// Remove all closed/error sessions.
+    pub fn clear_closed(&self) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, s| matches!(s.status, SessionStatus::Connecting | SessionStatus::Active));
     }
 
     pub fn cleanup_closed(&self) {
@@ -140,6 +167,6 @@ impl SessionManager {
 
 impl Default for SessionManager {
     fn default() -> Self {
-        Self::new(1000)
+        Self::new(500)
     }
 }

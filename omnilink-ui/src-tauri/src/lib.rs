@@ -23,7 +23,7 @@ pub struct AppStateInner {
     traffic_stats: Arc<TrafficStats>,
     /// Handle to the running service task (so we can abort it).
     service_handle: Option<tokio::task::JoinHandle<()>>,
-    rule_engine: Option<Arc<RuleEngine>>,
+    rule_engine: Option<Arc<std::sync::RwLock<RuleEngine>>>,
     virtual_dns: Arc<VirtualDns>,
     chain_relay: Option<Arc<ChainRelay>>,
     sysproxy_enabled: bool,
@@ -95,6 +95,13 @@ async fn get_sessions(state: State<'_, SharedState>) -> Result<Vec<SessionInfo>,
             }
         })
         .collect())
+}
+
+#[tauri::command]
+async fn clear_closed_sessions(state: State<'_, SharedState>) -> Result<String, String> {
+    let state = state.lock().await;
+    state.session_manager.clear_closed();
+    Ok("Closed sessions cleared".to_string())
 }
 
 #[tauri::command]
@@ -177,10 +184,10 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
     let listen_addr = config.general.listen_addr.clone();
 
     // Build rule engine
-    let rule_engine = Arc::new(RuleEngine::with_default_action(
+    let rule_engine = Arc::new(std::sync::RwLock::new(RuleEngine::with_default_action(
         config.rules.clone(),
         config.default_action.clone(),
-    ));
+    )));
     state_guard.rule_engine = Some(rule_engine.clone());
 
     // Build proxy map and chain relay
@@ -359,37 +366,66 @@ fn parse_action(action: &str, proxy_name: Option<&str>) -> Action {
 #[tauri::command]
 async fn add_rule(state: State<'_, SharedState>, req: AddRuleRequest) -> Result<String, String> {
     let mut state = state.lock().await;
-    let config = state.config.as_mut().ok_or("No configuration loaded")?;
-    let rule = Rule {
-        name: req.name,
-        conditions: req.conditions.iter().map(parse_condition).collect(),
-        action: parse_action(&req.action, req.proxy_name.as_deref()),
-        priority: req.priority,
-        enabled: true,
-        dns_mode: None,
+    let (rules_snapshot, default_action) = {
+        let config = state.config.as_mut().ok_or("No configuration loaded")?;
+        let rule = Rule {
+            name: req.name,
+            conditions: req.conditions.iter().map(parse_condition).collect(),
+            action: parse_action(&req.action, req.proxy_name.as_deref()),
+            priority: req.priority,
+            enabled: true,
+            dns_mode: None,
+        };
+        config.rules.push(rule);
+        (config.rules.clone(), config.default_action.clone())
     };
-    config.rules.push(rule);
+
+    // Sync to running rule engine
+    if let Some(re) = &state.rule_engine {
+        *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
+    }
+
     Ok("Rule added".to_string())
 }
 
 #[tauri::command]
 async fn toggle_rule(state: State<'_, SharedState>, index: usize) -> Result<String, String> {
     let mut state = state.lock().await;
-    let config = state.config.as_mut().ok_or("No configuration loaded")?;
-    let rule = config.rules.get_mut(index).ok_or("Rule not found")?;
-    rule.enabled = !rule.enabled;
-    Ok(format!("Rule '{}' {}", rule.name, if rule.enabled { "enabled" } else { "disabled" }))
+    let (msg, rules_snapshot, default_action) = {
+        let config = state.config.as_mut().ok_or("No configuration loaded")?;
+        let rule = config.rules.get_mut(index).ok_or("Rule not found")?;
+        rule.enabled = !rule.enabled;
+        let msg = format!("Rule '{}' {}", rule.name, if rule.enabled { "enabled" } else { "disabled" });
+        (msg, config.rules.clone(), config.default_action.clone())
+    };
+
+    // Sync to running rule engine
+    if let Some(re) = &state.rule_engine {
+        *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
+    }
+
+    Ok(msg)
 }
 
 #[tauri::command]
 async fn delete_rule(state: State<'_, SharedState>, index: usize) -> Result<String, String> {
     let mut state = state.lock().await;
-    let config = state.config.as_mut().ok_or("No configuration loaded")?;
-    if index >= config.rules.len() {
-        return Err("Rule not found".to_string());
+    let (msg, rules_snapshot, default_action) = {
+        let config = state.config.as_mut().ok_or("No configuration loaded")?;
+        if index >= config.rules.len() {
+            return Err("Rule not found".to_string());
+        }
+        let removed = config.rules.remove(index);
+        let msg = format!("Rule '{}' deleted", removed.name);
+        (msg, config.rules.clone(), config.default_action.clone())
+    };
+
+    // Sync to running rule engine
+    if let Some(re) = &state.rule_engine {
+        *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
-    let removed = config.rules.remove(index);
-    Ok(format!("Rule '{}' deleted", removed.name))
+
+    Ok(msg)
 }
 
 // --- Proxy CRUD ---
@@ -863,7 +899,7 @@ async fn migrate_credentials(state: State<'_, SharedState>) -> Result<Vec<String
 
 async fn run_service(
     listen_addr: &str,
-    rule_engine: Arc<RuleEngine>,
+    rule_engine: Arc<std::sync::RwLock<RuleEngine>>,
     virtual_dns: Arc<VirtualDns>,
     chain_relay: Arc<ChainRelay>,
     session_manager: Arc<SessionManager>,
@@ -887,6 +923,7 @@ async fn run_service(
         tokio::spawn(async move {
             let result = handle_connection(
                 &mut inbound,
+                peer_addr,
                 &rule_engine,
                 &virtual_dns,
                 &chain_relay,
@@ -905,7 +942,8 @@ async fn run_service(
 
 async fn handle_connection(
     inbound: &mut tokio::net::TcpStream,
-    rule_engine: &RuleEngine,
+    peer_addr: std::net::SocketAddr,
+    rule_engine: &std::sync::RwLock<RuleEngine>,
     virtual_dns: &VirtualDns,
     chain_relay: &ChainRelay,
     session_manager: &SessionManager,
@@ -998,17 +1036,28 @@ async fn handle_connection(
         ProxyDestination::Domain(_, p) => *p,
     };
 
+    // Look up the originating process from the SOCKS5 client's source port
+    let proc_info = tokio::task::spawn_blocking(move || {
+        omnilink_tun::process::lookup_process_by_socket(&peer_addr)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let process_name = proc_info.as_ref().map(|p| p.name.clone());
+    let process_path = proc_info.as_ref().map(|p| p.path.clone());
+
     let ctx = MatchContext {
-        process_name: None,
-        process_path: None,
+        process_name: process_name.clone(),
+        process_path: process_path.clone(),
         process_user: None,
         dest_domain: dest_domain.clone(),
         dest_ip,
         dest_port: port,
     };
 
-    let action = rule_engine.evaluate(&ctx);
-    tracing::info!(dest = %dest, action = ?action, "routing decision");
+    let action = rule_engine.read().unwrap().evaluate(&ctx);
+    tracing::info!(dest = %dest, process = ?process_name, action = ?action, "routing decision");
 
     let proxy_name = match &action {
         Action::Proxy(name) => Some(name.clone()),
@@ -1017,6 +1066,7 @@ async fn handle_connection(
 
     let session_id =
         session_manager.create_session(dest.to_string(), &action, proxy_name.clone());
+    session_manager.set_process_name(session_id, process_name, process_path);
     traffic_stats.record_connection_open(
         proxy_name.as_deref(),
         dest_domain.as_deref(),
@@ -1305,7 +1355,7 @@ pub fn run() {
         running: false,
         config: Some(Config::default_config()),
         config_path: PathBuf::from("config.yaml"),
-        session_manager: Arc::new(SessionManager::new(1000)),
+        session_manager: Arc::new(SessionManager::new(500)),
         traffic_stats: Arc::new(TrafficStats::new()),
         service_handle: None,
         rule_engine: None,
@@ -1331,6 +1381,7 @@ pub fn run() {
         .manage(Mutex::new(initial_state))
         .invoke_handler(tauri::generate_handler![
             get_sessions,
+            clear_closed_sessions,
             get_status,
             get_proxies,
             load_config,
