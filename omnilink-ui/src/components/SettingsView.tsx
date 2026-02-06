@@ -11,6 +11,13 @@ interface ProfileInfo {
   active: boolean;
 }
 
+interface NEStatusInfo {
+  installed: boolean;
+  enabled: boolean;
+  running: boolean;
+  server_running: boolean;
+}
+
 interface Props {
   state: AppState;
 }
@@ -29,6 +36,8 @@ function SettingsView({ state }: Props) {
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [newProfileName, setNewProfileName] = useState("");
   const [appVersion, setAppVersion] = useState("");
+  const [isMacOS] = useState(() => navigator.platform.toUpperCase().includes("MAC"));
+  const [neStatus, setNeStatus] = useState<NEStatusInfo>({ installed: false, enabled: false, running: false, server_running: false });
   const { updateInfo, progress, error, checkForUpdates, downloadAndInstall, restartApp } = useUpdater();
 
   useEffect(() => {
@@ -53,10 +62,21 @@ function SettingsView({ state }: Props) {
     }
   }, []);
 
+  const fetchNeStatus = useCallback(async () => {
+    if (!isMacOS) return;
+    try {
+      const status = await invoke<NEStatusInfo>("get_ne_status");
+      setNeStatus(status);
+    } catch (e) {
+      console.error("Failed to fetch NE status:", e);
+    }
+  }, [isMacOS]);
+
   useEffect(() => {
     fetchSysproxy();
     fetchProfiles();
-  }, [fetchSysproxy, fetchProfiles]);
+    fetchNeStatus();
+  }, [fetchSysproxy, fetchProfiles, fetchNeStatus]);
 
   const showMessage = (msg: string) => {
     setMessage(msg);
@@ -256,6 +276,51 @@ function SettingsView({ state }: Props) {
           </div>
         </div>
       </div>
+
+      {isMacOS && (
+        <div className="setting-group">
+          <h3>Network Extension (macOS)</h3>
+          <div className="setting-row">
+            <span className="setting-label">Extension Status</span>
+            <span className="setting-value">
+              {neStatus.installed ? (neStatus.running ? "Running" : "Installed") : "Not Installed"}
+            </span>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">NE Server</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span className="setting-value">
+                {neStatus.server_running ? "Running" : "Stopped"}
+              </span>
+              <button
+                className={`btn ${neStatus.server_running ? "" : "btn-primary"}`}
+                style={{ padding: "3px 10px", fontSize: 11 }}
+                onClick={async () => {
+                  try {
+                    const cmd = neStatus.server_running ? "stop_ne_server" : "start_ne_server";
+                    const result = await invoke<string>(cmd);
+                    showMessage(result);
+                    await fetchNeStatus();
+                  } catch (e) {
+                    showMessage(`Error: ${e}`);
+                  }
+                }}
+              >
+                {neStatus.server_running ? "Stop" : "Start"}
+              </button>
+            </div>
+          </div>
+          <div className="setting-row">
+            <span
+              className="setting-label"
+              style={{ fontSize: 11, color: "var(--text-secondary)" }}
+            >
+              Network Extension captures all TCP/UDP traffic at the OS level.
+              Requires Apple entitlement for distribution.
+            </span>
+          </div>
+        </div>
+      )}
 
       <div className="setting-group">
         <h3>Profiles</h3>

@@ -41,6 +41,9 @@ pub struct AppStateInner {
     /// Handle to the running interceptor task.
     interceptor_handle: Option<tokio::task::JoinHandle<()>>,
     interceptor_running: bool,
+    /// NE interceptor instance (for stopping the socket server).
+    ne_interceptor: Option<Box<dyn omnilink_tun::interceptor::Interceptor>>,
+    ne_server_running: bool,
 }
 
 pub type SharedState = Mutex<AppStateInner>;
@@ -1249,13 +1252,19 @@ pub struct NEStatusInfo {
     pub installed: bool,
     pub enabled: bool,
     pub running: bool,
+    #[serde(default)]
+    pub server_running: bool,
 }
 
 /// Start the NE socket server (Rust backend for Network Extension).
 #[cfg(target_os = "macos")]
 #[tauri::command]
 async fn start_ne_server(state: State<'_, SharedState>) -> Result<String, String> {
-    let state_guard = state.lock().await;
+    let mut state_guard = state.lock().await;
+
+    if state_guard.ne_server_running {
+        return Err("NE server is already running".to_string());
+    }
 
     let config = state_guard.config.clone().ok_or("No configuration loaded")?;
 
@@ -1291,8 +1300,10 @@ async fn start_ne_server(state: State<'_, SharedState>) -> Result<String, String
         .await
         .map_err(|e| format!("Failed to start NE server: {}", e))?;
 
-    // Store the interceptor (we'd need to add a field for this)
-    // For now, just indicate success
+    // Store interceptor for stopping later
+    state_guard.ne_interceptor = Some(ne_interceptor);
+    state_guard.ne_server_running = true;
+
     tracing::info!("NE socket server started");
 
     Ok("NE socket server started at /var/run/omnilink.sock".to_string())
@@ -1307,10 +1318,21 @@ async fn start_ne_server(_state: State<'_, SharedState>) -> Result<String, Strin
 /// Stop the NE socket server.
 #[cfg(target_os = "macos")]
 #[tauri::command]
-async fn stop_ne_server(_state: State<'_, SharedState>) -> Result<String, String> {
-    // Note: Currently we don't track the NE interceptor instance
-    // This would need proper state management
-    Ok("NE socket server stop requested".to_string())
+async fn stop_ne_server(state: State<'_, SharedState>) -> Result<String, String> {
+    let mut state_guard = state.lock().await;
+
+    if !state_guard.ne_server_running {
+        return Err("NE server is not running".to_string());
+    }
+
+    if let Some(mut interceptor) = state_guard.ne_interceptor.take() {
+        interceptor.stop().await.map_err(|e| format!("Failed to stop NE server: {}", e))?;
+    }
+
+    state_guard.ne_server_running = false;
+    tracing::info!("NE socket server stopped");
+
+    Ok("NE socket server stopped".to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1322,7 +1344,11 @@ async fn stop_ne_server(_state: State<'_, SharedState>) -> Result<String, String
 /// Get Network Extension status by calling the helper CLI.
 #[cfg(target_os = "macos")]
 #[tauri::command]
-async fn get_ne_status() -> Result<NEStatusInfo, String> {
+async fn get_ne_status(state: State<'_, SharedState>) -> Result<NEStatusInfo, String> {
+    let state_guard = state.lock().await;
+    let server_running = state_guard.ne_server_running;
+    drop(state_guard);
+
     // Try to call the NE helper
     let helper_path = std::env::current_exe()
         .map(|p| p.parent().unwrap_or(std::path::Path::new(".")).join("omnilink-ne-helper"))
@@ -1335,7 +1361,9 @@ async fn get_ne_status() -> Result<NEStatusInfo, String> {
         {
             Ok(output) if output.status.success() => {
                 let json = String::from_utf8_lossy(&output.stdout);
-                serde_json::from_str(&json).map_err(|e| e.to_string())
+                let mut info: NEStatusInfo = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                info.server_running = server_running;
+                Ok(info)
             }
             Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
             Err(e) => Err(format!("Failed to execute NE helper: {}", e)),
@@ -1346,13 +1374,14 @@ async fn get_ne_status() -> Result<NEStatusInfo, String> {
             installed: false,
             enabled: false,
             running: false,
+            server_running,
         })
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
-async fn get_ne_status() -> Result<NEStatusInfo, String> {
+async fn get_ne_status(_state: State<'_, SharedState>) -> Result<NEStatusInfo, String> {
     Err("Network Extension is only supported on macOS".to_string())
 }
 
@@ -1424,6 +1453,8 @@ pub fn run() {
         connection_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         interceptor_handle: None,
         interceptor_running: false,
+        ne_interceptor: None,
+        ne_server_running: false,
     };
 
     let mut builder = tauri::Builder::default();

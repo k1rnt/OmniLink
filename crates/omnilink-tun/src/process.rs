@@ -387,8 +387,8 @@ mod macos {
             return false;
         }
 
-        // Compare local port (network byte order in the struct)
-        let local_port = ini.insi_lport as u16;
+        // Compare local port (stored in network byte order, needs ntohs)
+        let local_port = u16::from_be(ini.insi_lport as u16);
         if local_port != target_addr.port() {
             return false;
         }
