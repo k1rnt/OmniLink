@@ -90,7 +90,11 @@ pub struct ProxyServerConfig {
 impl ProxyServerConfig {
     /// Convert to ProxyServer, retrieving credentials from keychain if needed.
     pub fn to_proxy_server(&self) -> anyhow::Result<ProxyServer> {
-        let addr = format!("{}:{}", self.address, self.port).parse()?;
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:{}", self.address, self.port);
+        let addr = addr_str.to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve address: {}", addr_str))?;
 
         // Try to get auth from keychain if has_auth is set
         let auth = if self.has_auth {
