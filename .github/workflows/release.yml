@@ -44,6 +44,9 @@ jobs:
       - name: Build Tauri app
         run: pnpm tauri build --target ${{ matrix.target }}
         working-directory: omnilink-ui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -52,6 +55,8 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             target/${{ matrix.target }}/release/bundle/macos/*.app
+            target/${{ matrix.target }}/release/bundle/macos/*.tar.gz
+            target/${{ matrix.target }}/release/bundle/macos/*.tar.gz.sig
 
   create-universal:
     needs: build-macos
@@ -146,13 +151,9 @@ jobs:
       - name: Build Tauri app
         run: pnpm run tauri build
         working-directory: omnilink-ui
-
-      - name: List bundle output
-        run: |
-          echo "=== Bundle directory structure ==="
-          find target -name "bundle" -type d 2>/dev/null || true
-          find target -name "*.deb" -o -name "*.AppImage" 2>/dev/null || true
-          ls -la target/release/bundle/ 2>/dev/null || true
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -161,6 +162,8 @@ jobs:
           path: |
             target/release/bundle/deb/*.deb
             target/release/bundle/appimage/*.AppImage
+            target/release/bundle/appimage/*.AppImage.tar.gz
+            target/release/bundle/appimage/*.AppImage.tar.gz.sig
           if-no-files-found: warn
 
   build-windows:
@@ -193,13 +196,9 @@ jobs:
       - name: Build Tauri app
         run: pnpm run tauri build
         working-directory: omnilink-ui
-
-      - name: List bundle output
-        shell: bash
-        run: |
-          echo "=== Bundle directory structure ==="
-          find target -name "bundle" -type d 2>/dev/null || true
-          find target -name "*.msi" -o -name "*.exe" 2>/dev/null || true
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -208,6 +207,8 @@ jobs:
           path: |
             target/release/bundle/msi/*.msi
             target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.nsis.zip
+            target/release/bundle/nsis/*.nsis.zip.sig
           if-no-files-found: warn
 
   release:
@@ -233,28 +234,44 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           TAG="${{ github.ref_name }}"
 
-          # Generate latest.json
-          cat > artifacts/latest.json << EOF
+          # Read signatures from .sig files
+          DARWIN_AARCH64_SIG=$(find artifacts/OmniLink-aarch64-apple-darwin -name "*.tar.gz.sig" | head -1 | xargs cat 2>/dev/null || echo "")
+          DARWIN_X86_64_SIG=$(find artifacts/OmniLink-x86_64-apple-darwin -name "*.tar.gz.sig" | head -1 | xargs cat 2>/dev/null || echo "")
+          LINUX_SIG=$(find artifacts/OmniLink-linux -name "*.AppImage.tar.gz.sig" | head -1 | xargs cat 2>/dev/null || echo "")
+          WINDOWS_SIG=$(find artifacts/OmniLink-windows -name "*.nsis.zip.sig" | head -1 | xargs cat 2>/dev/null || echo "")
+
+          # Find updater artifact filenames
+          DARWIN_AARCH64_FILE=$(find artifacts/OmniLink-aarch64-apple-darwin -name "*.tar.gz" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
+          DARWIN_X86_64_FILE=$(find artifacts/OmniLink-x86_64-apple-darwin -name "*.tar.gz" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
+          LINUX_FILE=$(find artifacts/OmniLink-linux -name "*.AppImage.tar.gz" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
+          WINDOWS_FILE=$(find artifacts/OmniLink-windows -name "*.nsis.zip" ! -name "*.sig" | head -1 | xargs basename 2>/dev/null || echo "")
+
+          # Generate latest.json with signatures
+          cat > artifacts/latest.json << ENDJSON
           {
             "version": "${VERSION}",
             "notes": "See release notes at https://github.com/k1rnt/OmniLink/releases/tag/${TAG}",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
               "darwin-aarch64": {
-                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/OmniLink-${TAG}-universal.dmg"
+                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/${DARWIN_AARCH64_FILE}",
+                "signature": "${DARWIN_AARCH64_SIG}"
               },
               "darwin-x86_64": {
-                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/OmniLink-${TAG}-universal.dmg"
+                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/${DARWIN_X86_64_FILE}",
+                "signature": "${DARWIN_X86_64_SIG}"
               },
               "linux-x86_64": {
-                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/omnilink-tauri_${VERSION}_amd64.AppImage"
+                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/${LINUX_FILE}",
+                "signature": "${LINUX_SIG}"
               },
               "windows-x86_64": {
-                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/OmniLink_${VERSION}_x64-setup.exe"
+                "url": "https://github.com/k1rnt/OmniLink/releases/download/${TAG}/${WINDOWS_FILE}",
+                "signature": "${WINDOWS_SIG}"
               }
             }
           }
-          EOF
+          ENDJSON
 
           cat artifacts/latest.json
 
@@ -264,11 +281,15 @@ jobs:
           files: |
             artifacts/OmniLink-universal/*.dmg
             artifacts/OmniLink-aarch64-apple-darwin/**/*.dmg
+            artifacts/OmniLink-aarch64-apple-darwin/**/*.tar.gz
             artifacts/OmniLink-x86_64-apple-darwin/**/*.dmg
+            artifacts/OmniLink-x86_64-apple-darwin/**/*.tar.gz
             artifacts/OmniLink-linux/**/*.deb
             artifacts/OmniLink-linux/**/*.AppImage
+            artifacts/OmniLink-linux/**/*.AppImage.tar.gz
             artifacts/OmniLink-windows/**/*.msi
             artifacts/OmniLink-windows/**/*.exe
+            artifacts/OmniLink-windows/**/*.nsis.zip
             artifacts/latest.json
           draft: true
           generate_release_notes: true
