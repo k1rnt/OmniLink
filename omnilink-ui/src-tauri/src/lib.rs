@@ -14,6 +14,15 @@ use omnilink_core::session::SessionManager;
 use omnilink_core::stats::TrafficStats;
 use omnilink_core::sysproxy::SysProxyConfig;
 
+/// Write config to disk (best-effort, errors silently ignored).
+fn auto_save(state: &AppStateInner) {
+    if let Some(config) = &state.config {
+        if let Ok(yaml) = serde_yaml::to_string(config) {
+            let _ = std::fs::write(&state.config_path, &yaml);
+        }
+    }
+}
+
 /// Shared application state managed by Tauri.
 pub struct AppStateInner {
     running: bool,
@@ -400,6 +409,7 @@ async fn add_rule(state: State<'_, SharedState>, req: AddRuleRequest) -> Result<
         *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
 
+    auto_save(&state);
     Ok("Rule added".to_string())
 }
 
@@ -419,6 +429,7 @@ async fn toggle_rule(state: State<'_, SharedState>, index: usize) -> Result<Stri
         *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
 
+    auto_save(&state);
     Ok(msg)
 }
 
@@ -440,6 +451,7 @@ async fn delete_rule(state: State<'_, SharedState>, index: usize) -> Result<Stri
         *re.write().unwrap() = RuleEngine::with_default_action(rules_snapshot, default_action);
     }
 
+    auto_save(&state);
     Ok(msg)
 }
 
@@ -489,6 +501,7 @@ async fn add_proxy(state: State<'_, SharedState>, req: AddProxyRequest) -> Resul
         has_auth,
     });
 
+    auto_save(&state);
     Ok(format!("Proxy '{}' added", req.name))
 }
 
@@ -511,6 +524,7 @@ async fn delete_proxy(state: State<'_, SharedState>, name: String) -> Result<Str
     if config.proxies.len() == before {
         return Err(format!("Proxy '{}' not found", name));
     }
+    auto_save(&state);
     Ok(format!("Proxy '{}' deleted", name))
 }
 
@@ -566,6 +580,7 @@ async fn add_chain(state: State<'_, SharedState>, req: AddChainRequest) -> Resul
         mode,
     });
 
+    auto_save(&state);
     Ok(format!("Chain '{}' added", req.name))
 }
 
@@ -578,6 +593,7 @@ async fn delete_chain(state: State<'_, SharedState>, name: String) -> Result<Str
     if config.chains.len() == before {
         return Err(format!("Chain '{}' not found", name));
     }
+    auto_save(&state);
     Ok(format!("Chain '{}' deleted", name))
 }
 
@@ -723,6 +739,15 @@ async fn save_config(state: State<'_, SharedState>) -> Result<String, String> {
     let yaml = serde_yaml::to_string(config).map_err(|e| e.to_string())?;
     std::fs::write(&state.config_path, yaml).map_err(|e| e.to_string())?;
     Ok(format!("Configuration saved to {}", state.config_path.display()))
+}
+
+#[tauri::command]
+async fn save_config_to(state: State<'_, SharedState>, path: String) -> Result<String, String> {
+    let state = state.lock().await;
+    let config = state.config.as_ref().ok_or("No configuration loaded")?;
+    let yaml = serde_yaml::to_string(config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, yaml).map_err(|e| e.to_string())?;
+    Ok(format!("Configuration saved to {}", path))
 }
 
 // --- Interceptor ---
@@ -1400,6 +1425,7 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder
+            .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_updater::Builder::new().build())
             .plugin(tauri_plugin_process::init());
     }
@@ -1432,6 +1458,7 @@ pub fn run() {
             switch_profile,
             save_profile,
             save_config,
+            save_config_to,
             start_interceptor,
             stop_interceptor,
             get_interceptor_status,
@@ -1445,6 +1472,27 @@ pub fn run() {
             list_installed_apps,
             export_rules_yaml,
         ])
+        .setup(|app| {
+            use tauri::Manager;
+            let data_dir = app.path().app_data_dir().expect("failed to resolve app data dir");
+            std::fs::create_dir_all(&data_dir).ok();
+            let config_path = data_dir.join("config.yaml");
+            let state = app.state::<SharedState>();
+            let mut s = tauri::async_runtime::block_on(state.lock());
+            s.config_path = config_path.clone();
+            if config_path.exists() {
+                match Config::load(&config_path) {
+                    Ok(config) => {
+                        tracing::info!("Loaded config from {}", config_path.display());
+                        s.config = Some(config);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load config from {}: {}", config_path.display(), e);
+                    }
+                }
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useUpdater } from "../hooks/useUpdater";
 import type { AppState } from "../types";
 
@@ -24,7 +25,6 @@ function formatBytes(bytes: number): string {
 
 function SettingsView({ state }: Props) {
   const [sysproxyEnabled, setSysproxyEnabled] = useState(false);
-  const [configPath, setConfigPath] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [newProfileName, setNewProfileName] = useState("");
@@ -75,8 +75,12 @@ function SettingsView({ state }: Props) {
 
   const handleLoadConfig = async () => {
     try {
-      const path = configPath || undefined;
-      const result = await invoke<string>("load_config", { path });
+      const filePath = await openDialog({
+        filters: [{ name: "YAML", extensions: ["yaml", "yml"] }],
+        multiple: false,
+      });
+      if (!filePath) return;
+      const result = await invoke<string>("load_config", { path: filePath });
       showMessage(result);
     } catch (e) {
       showMessage(`Error: ${e}`);
@@ -85,7 +89,12 @@ function SettingsView({ state }: Props) {
 
   const handleSaveConfig = async () => {
     try {
-      const result = await invoke<string>("save_config");
+      const filePath = await saveDialog({
+        defaultPath: "config.yaml",
+        filters: [{ name: "YAML", extensions: ["yaml", "yml"] }],
+      });
+      if (!filePath) return;
+      const result = await invoke<string>("save_config_to", { path: filePath });
       showMessage(result);
     } catch (e) {
       showMessage(`Error: ${e}`);
@@ -311,24 +320,15 @@ function SettingsView({ state }: Props) {
       <div className="setting-group">
         <h3>Configuration</h3>
         <div className="setting-row">
-          <span className="setting-label">Config File</span>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input
-              className="search-input"
-              placeholder="config.yaml"
-              value={configPath}
-              onChange={(e) => setConfigPath(e.target.value)}
-              style={{ width: 200 }}
-            />
-            <button className="btn" style={{ padding: "3px 10px", fontSize: 11 }} onClick={handleLoadConfig}>
-              Load
-            </button>
-          </div>
+          <span className="setting-label">Load Config File</span>
+          <button className="btn" style={{ padding: "3px 10px", fontSize: 11 }} onClick={handleLoadConfig}>
+            Open...
+          </button>
         </div>
         <div className="setting-row">
-          <span className="setting-label">Save Current Config</span>
+          <span className="setting-label">Export Config File</span>
           <button className="btn" style={{ padding: "3px 10px", fontSize: 11 }} onClick={handleSaveConfig}>
-            Save
+            Save As...
           </button>
         </div>
       </div>

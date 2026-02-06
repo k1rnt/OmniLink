@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirm, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import ConnectionsView from "./components/ConnectionsView";
 import RulesView from "./components/RulesView";
 import ProxiesView from "./components/ProxiesView";
@@ -40,6 +42,33 @@ function App() {
     const interval = setInterval(fetchStatus, 2000);
     return () => clearInterval(interval);
   }, [fetchStatus]);
+
+  useEffect(() => {
+    const unlisten = getCurrentWindow().onCloseRequested(async (event) => {
+      event.preventDefault();
+      const shouldSave = await confirm("Save configuration before closing?", {
+        title: "OmniLink",
+        kind: "warning",
+      });
+      if (shouldSave) {
+        const filePath = await saveDialog({
+          defaultPath: "config.yaml",
+          filters: [{ name: "YAML", extensions: ["yaml", "yml"] }],
+        });
+        if (filePath) {
+          try {
+            await invoke("save_config_to", { path: filePath });
+          } catch (e) {
+            console.error("Failed to save config:", e);
+          }
+        }
+      }
+      await getCurrentWindow().destroy();
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
 
   const toggleService = async () => {
     try {
