@@ -4,7 +4,9 @@
 //! to query the original destination of NAT-redirected connections via
 //! the `DIOCNATLOOK` ioctl on `/dev/pf`.
 
-/// PF direction: outbound.
+/// PF direction: inbound (used for rdr rules).
+pub const PF_IN: u8 = 1;
+/// PF direction: outbound (used for nat rules).
 pub const PF_OUT: u8 = 2;
 
 /// IPv4 address family.

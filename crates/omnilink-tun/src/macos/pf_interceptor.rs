@@ -416,7 +416,7 @@ fn lookup_original_dst_ioctl(
     let mut pnl = pf_sys::PfiocNatlook::default();
     pnl.af = pf_sys::AF_INET;
     pnl.proto = pf_sys::IPPROTO_TCP;
-    pnl.direction = pf_sys::PF_OUT;
+    pnl.direction = pf_sys::PF_IN;
 
     // Source: the application's address
     pnl.saddr.v4 = u32::from(peer_v4).to_be();
