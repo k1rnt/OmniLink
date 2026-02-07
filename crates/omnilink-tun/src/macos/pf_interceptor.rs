@@ -293,6 +293,21 @@ fn install_pf_rules(
     }
 
     tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules and references installed");
+
+    // Verify rules are actually loaded in the anchor
+    if let Ok(verify_out) = std::process::Command::new("pfctl")
+        .args(["-a", ANCHOR_NAME, "-sr"])
+        .output()
+    {
+        let loaded_rules = String::from_utf8_lossy(&verify_out.stdout);
+        if loaded_rules.trim().is_empty() {
+            return Err(InterceptorError::RoutingSetup(
+                "pf anchor rules are empty after installation".to_string(),
+            ));
+        }
+        tracing::info!(rules = %loaded_rules.trim(), "pf anchor rules verified");
+    }
+
     Ok(())
 }
 
@@ -343,8 +358,10 @@ async fn run_pf_accept_loop(
                     continue;
                 }
 
-                // Look up process info
-                let proc_info = crate::process::lookup_process_by_socket(&peer_addr);
+                // Look up process info (lsof is blocking, so use spawn_blocking)
+                let proc_info = tokio::task::spawn_blocking(move || {
+                    crate::process::lookup_process_by_socket(&peer_addr)
+                }).await.ok().flatten();
 
                 let conn = InterceptedConnection {
                     original_dst,
@@ -406,7 +423,7 @@ fn lookup_original_dst_ioctl(
     let ret = unsafe { libc::ioctl(pf_fd, pf_sys::diocnatlook_ioctl(), &mut pnl) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
-        tracing::trace!(error = %err, "DIOCNATLOOK failed");
+        tracing::debug!(error = %err, "DIOCNATLOOK failed");
         return None;
     }
 

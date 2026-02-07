@@ -203,6 +203,10 @@ async fn start_service(state: State<'_, SharedState>) -> Result<String, String> 
         return Err("Service is already running".to_string());
     }
 
+    if state_guard.pf_interceptor_running {
+        return Err("Stop pf interceptor before starting SOCKS service (they cannot run simultaneously)".to_string());
+    }
+
     let config = state_guard
         .config
         .clone()
@@ -1068,11 +1072,35 @@ async fn run_service(
     }
 }
 
+/// AsyncRead wrapper that atomically counts bytes read.
+struct CountingReader<R> {
+    inner: R,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let n = buf.filled().len() - before;
+            this.counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+}
+
 /// Bidirectional relay that periodically reports byte counts to the session manager.
+/// Uses tokio::io::copy (robust EOF/shutdown handling) with CountingReader for stats.
 async fn relay_with_stats<R1, W1, R2, W2>(
-    mut client_read: R1,
+    client_read: R1,
     mut client_write: W1,
-    mut remote_read: R2,
+    remote_read: R2,
     mut remote_write: W2,
     session_manager: Arc<SessionManager>,
     traffic_stats: Arc<TrafficStats>,
@@ -1087,40 +1115,12 @@ async fn relay_with_stats<R1, W1, R2, W2>(
     W2: tokio::io::AsyncWrite + Unpin,
 {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
 
     let sent_total = Arc::new(AtomicU64::new(0));
     let recv_total = Arc::new(AtomicU64::new(0));
 
-    let sent_c = sent_total.clone();
-    let recv_c = recv_total.clone();
-
-    // Upload: client → remote
-    let upload = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = client_read.read(&mut buf).await?;
-            if n == 0 { break; }
-            remote_write.write_all(&buf[..n]).await?;
-            sent_c.fetch_add(n as u64, Ordering::Relaxed);
-        }
-        remote_write.shutdown().await?;
-        Ok::<(), std::io::Error>(())
-    };
-
-    // Download: remote → client
-    let download = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = remote_read.read(&mut buf).await?;
-            if n == 0 { break; }
-            client_write.write_all(&buf[..n]).await?;
-            recv_c.fetch_add(n as u64, Ordering::Relaxed);
-        }
-        client_write.shutdown().await?;
-        Ok::<(), std::io::Error>(())
-    };
+    let mut counting_client = CountingReader { inner: client_read, counter: sent_total.clone() };
+    let mut counting_remote = CountingReader { inner: remote_read, counter: recv_total.clone() };
 
     // Periodic stats reporter
     let sent_r = sent_total.clone();
@@ -1148,20 +1148,21 @@ async fn relay_with_stats<R1, W1, R2, W2>(
     };
 
     tokio::select! {
-        _ = async { tokio::try_join!(upload, download) } => {}
+        _ = async {
+            let _ = tokio::try_join!(
+                tokio::io::copy(&mut counting_client, &mut remote_write),
+                tokio::io::copy(&mut counting_remote, &mut client_write),
+            );
+        } => {}
         _ = cancel_token.cancelled() => {
             tracing::info!(session_id, "connection terminated by user");
         }
-        _ = reporter => {} // runs forever, exits when other branches complete
+        _ = reporter => {}
     }
 
-    // Final flush: report any remaining unreported bytes
+    // Final: set absolute byte totals
     let final_sent = sent_total.load(Ordering::Relaxed);
     let final_recv = recv_total.load(Ordering::Relaxed);
-    // We report the full totals one more time; update_bytes is additive but we need
-    // to compute the delta from what the reporter already sent.
-    // Since reporter may have been interrupted mid-cycle, just report everything
-    // and reset the session bytes to the final totals.
     session_manager.set_bytes(session_id, final_sent, final_recv);
     traffic_stats.record_bytes(0, 0, proxy_name.as_deref(), dest_domain.as_deref());
 }
@@ -1577,6 +1578,10 @@ async fn start_pf_interceptor(state: State<'_, SharedState>) -> Result<String, S
         return Err("pf interceptor is already running".to_string());
     }
 
+    if state_guard.running {
+        return Err("Stop SOCKS service before starting pf interceptor (they cannot run simultaneously)".to_string());
+    }
+
     let config = state_guard.config.clone().ok_or("No configuration loaded")?;
 
     // Build rule engine
@@ -1757,7 +1762,7 @@ async fn get_pf_interceptor_status(state: State<'_, SharedState>) -> Result<bool
 /// Handle a single pf-intercepted connection.
 #[cfg(target_os = "macos")]
 async fn handle_pf_connection(
-    mut inbound: tokio::net::TcpStream,
+    inbound: tokio::net::TcpStream,
     dest: omnilink_core::proxy::ProxyDestination,
     action: &Action,
     chain_relay: &Arc<ChainRelay>,
@@ -1807,23 +1812,14 @@ async fn handle_pf_connection(
             socket.bind(std::net::SocketAddr::from(([0, 0, 0, 0], bypass_port)))
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             match socket.connect(target).await {
-                Ok(mut outbound) => {
-                    let (mut ri, mut wi) = inbound.split();
-                    let (mut ro, mut wo) = outbound.split();
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {}
-                        result = async {
-                            tokio::try_join!(
-                                tokio::io::copy(&mut ri, &mut wo),
-                                tokio::io::copy(&mut ro, &mut wi),
-                            )
-                        } => {
-                            if let Ok((sent, received)) = result {
-                                session_manager.update_bytes(session_id, sent, received);
-                                traffic_stats.record_bytes(sent, received, proxy_name.as_deref(), dest_domain.as_deref());
-                            }
-                        }
-                    }
+                Ok(outbound) => {
+                    let (ri, wi) = tokio::io::split(inbound);
+                    let (ro, wo) = tokio::io::split(outbound);
+                    relay_with_stats(
+                        ri, wi, ro, wo,
+                        session_manager.clone(), traffic_stats.clone(),
+                        session_id, proxy_name, dest_domain, cancel_token,
+                    ).await;
                     session_manager.update_status(session_id, SessionStatus::Closed);
                     traffic_stats.record_connection_close();
                     Ok(())
@@ -1838,23 +1834,14 @@ async fn handle_pf_connection(
         Action::Proxy(pname) => {
             session_manager.update_status(session_id, SessionStatus::Active);
             match chain_relay.connect(pname, &dest).await {
-                Ok(mut outbound) => {
-                    let (mut ri, mut wi) = inbound.split();
-                    let (mut ro, mut wo) = outbound.split();
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {}
-                        result = async {
-                            tokio::try_join!(
-                                tokio::io::copy(&mut ri, &mut wo),
-                                tokio::io::copy(&mut ro, &mut wi),
-                            )
-                        } => {
-                            if let Ok((sent, received)) = result {
-                                session_manager.update_bytes(session_id, sent, received);
-                                traffic_stats.record_bytes(sent, received, proxy_name.as_deref(), dest_domain.as_deref());
-                            }
-                        }
-                    }
+                Ok(outbound) => {
+                    let (ri, wi) = tokio::io::split(inbound);
+                    let (ro, wo) = tokio::io::split(outbound);
+                    relay_with_stats(
+                        ri, wi, ro, wo,
+                        session_manager.clone(), traffic_stats.clone(),
+                        session_id, proxy_name, dest_domain, cancel_token,
+                    ).await;
                     session_manager.update_status(session_id, SessionStatus::Closed);
                     traffic_stats.record_connection_close();
                     Ok(())
