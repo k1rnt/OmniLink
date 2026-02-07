@@ -163,7 +163,7 @@ fn install_pf_rules(
 
     // --- Translation rules (rdr) ---
     rules.push_str(&format!(
-        "rdr pass on lo0 proto tcp from any to any -> 127.0.0.1 port {}\n",
+        "rdr pass on lo0 proto tcp from any to !127.0.0.0/8 -> 127.0.0.1 port {}\n",
         listener_port
     ));
 

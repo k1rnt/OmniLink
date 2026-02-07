@@ -1596,15 +1596,16 @@ async fn start_pf_interceptor(state: State<'_, SharedState>) -> Result<String, S
         let server = proxy_cfg.to_proxy_server().map_err(|e| e.to_string())?;
         proxy_map.insert(proxy_cfg.name.clone(), server);
     }
-    let chain_relay = Arc::new(ChainRelay::new(config.chains.clone(), proxy_map));
 
-    // Collect excluded IPs (proxy server addresses to prevent loops)
+    // Collect excluded IPs (proxy server addresses to prevent routing loops)
     let mut excluded_ips = Vec::new();
-    for proxy_cfg in &config.proxies {
-        if let Ok(ip) = proxy_cfg.address.parse::<std::net::Ipv4Addr>() {
+    for server in proxy_map.values() {
+        if let std::net::IpAddr::V4(ip) = server.addr.ip() {
             excluded_ips.push(ip);
         }
     }
+
+    let chain_relay = Arc::new(ChainRelay::new(config.chains.clone(), proxy_map));
 
     let virtual_dns = state_guard.virtual_dns.clone();
     let session_manager = state_guard.session_manager.clone();
