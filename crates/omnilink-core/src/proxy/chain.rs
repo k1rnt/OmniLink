@@ -201,7 +201,8 @@ pub async fn connect_single(
         ProxyProtocol::Socks4 => super::socks4::connect(server, dest).await,
         ProxyProtocol::Socks4a => super::socks4::connect_4a(server, dest).await,
         ProxyProtocol::Socks5 => super::socks5::connect(server, dest).await,
-        ProxyProtocol::Http | ProxyProtocol::Https => super::http::connect(server, dest).await,
+        ProxyProtocol::Http => super::http::connect(server, dest).await,
+        ProxyProtocol::Https => super::https::connect(server, dest).await,
         ProxyProtocol::SshTunnel => super::ssh::connect(server, dest).await,
     }
 }
@@ -316,7 +317,12 @@ async fn tunnel_through(
 
             Ok(stream)
         }
-        ProxyProtocol::Http | ProxyProtocol::Https => {
+        ProxyProtocol::Https => {
+            return Err(ProxyError::ProtocolError(
+                "HTTPS proxy cannot be used as intermediate proxy in strict chains".to_string(),
+            ));
+        }
+        ProxyProtocol::Http => {
             let target = match dest {
                 ProxyDestination::SocketAddr(addr) => addr.to_string(),
                 ProxyDestination::Domain(domain, port) => format!("{}:{}", domain, port),

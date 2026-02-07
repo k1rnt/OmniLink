@@ -110,11 +110,19 @@ impl ProxyServerConfig {
             self.auth.clone()
         };
 
+        // Preserve hostname for TLS SNI (None if the address was an IP literal)
+        let hostname = if self.address.parse::<std::net::IpAddr>().is_err() {
+            Some(self.address.clone())
+        } else {
+            None
+        };
+
         Ok(ProxyServer {
             name: self.name.clone(),
             protocol: self.protocol.clone(),
             addr,
             auth,
+            hostname,
         })
     }
 }

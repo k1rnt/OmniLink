@@ -198,22 +198,9 @@ pub fn is_helper_running() -> bool {
     Path::new(SOCKET_PATH).exists()
 }
 
-/// Stop the pf helper process and clean up socket/PID files.
+/// Best-effort cleanup of socket/PID files from unprivileged context.
+/// Actual process kill is done via osascript (root) in flush_pf_rules/install_pf_rules.
 pub fn stop_pf_helper() {
-    // Try to kill via PID file
-    if let Ok(pid_str) = std::fs::read_to_string(PID_PATH) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            // Force kill if still alive
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-
     let _ = std::fs::remove_file(SOCKET_PATH);
     let _ = std::fs::remove_file(PID_PATH);
 }

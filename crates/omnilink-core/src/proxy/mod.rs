@@ -1,5 +1,6 @@
 pub mod chain;
 pub mod http;
+pub mod https;
 pub mod socks4;
 pub mod socks5;
 pub mod ssh;
@@ -58,6 +59,9 @@ pub struct ProxyServer {
     pub protocol: ProxyProtocol,
     pub addr: SocketAddr,
     pub auth: Option<ProxyAuth>,
+    /// Original hostname for TLS SNI (None if address was an IP).
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

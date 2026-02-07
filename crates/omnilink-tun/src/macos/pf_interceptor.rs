@@ -201,31 +201,34 @@ fn install_pf_rules(
         .to_string()
         .replace('\'', "'\\''");
 
-    // Kill any existing helper before launching a new one
-    pf_helper::stop_pf_helper();
-
-    // Single admin command: pfctl setup + helper launch (one password prompt)
+    // Single admin command: kill existing helper + pfctl setup + helper launch (one password prompt)
+    // Uses mktemp to prevent /tmp symlink attacks (Fix #3)
+    // Kills existing helper with root privileges via osascript (Fix #5)
     let cmd = format!(
-        "trap 'rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf' EXIT; \
-         printf '{}' > /tmp/omnilink_pf_anchor.conf && \
-         pfctl -a {} -f /tmp/omnilink_pf_anchor.conf 2>&1 && \
+        "kill $(cat {pid_path} 2>/dev/null) 2>/dev/null; \
+         rm -f {sock_path} {pid_path}; \
+         ANCHOR_CONF=$(mktemp /tmp/omnilink_pf.XXXXXX) && \
+         MAIN_CONF=$(mktemp /tmp/omnilink_pf.XXXXXX) && \
+         trap 'rm -f $ANCHOR_CONF $MAIN_CONF' EXIT && \
+         printf '{rules}' > $ANCHOR_CONF && \
+         pfctl -a {anchor} -f $ANCHOR_CONF 2>&1 && \
          {{ grep '^scrub-anchor' /etc/pf.conf 2>/dev/null; \
          grep '^nat-anchor' /etc/pf.conf 2>/dev/null; \
          grep '^rdr-anchor' /etc/pf.conf 2>/dev/null; \
-         echo 'rdr-anchor \"{}\"'; \
+         echo 'rdr-anchor \"{anchor}\"'; \
          grep '^dummynet-anchor' /etc/pf.conf 2>/dev/null; \
          grep '^anchor' /etc/pf.conf 2>/dev/null; \
-         echo 'anchor \"{}\"'; \
+         echo 'anchor \"{anchor}\"'; \
          grep '^load' /etc/pf.conf 2>/dev/null; \
-         true; }} > /tmp/omnilink_pf_main.conf && \
-         pfctl -f /tmp/omnilink_pf_main.conf 2>&1 && \
+         true; }} > $MAIN_CONF && \
+         pfctl -f $MAIN_CONF 2>&1 && \
          (pfctl -e 2>&1 || true) && \
-         ('{}' --pf-helper </dev/null >/tmp/omnilink_pf_helper.log 2>&1 &)",
-        rules_escaped,
-        ANCHOR_NAME,
-        ANCHOR_NAME,
-        ANCHOR_NAME,
-        exe_path,
+         ('{exe}' --pf-helper </dev/null >/tmp/omnilink_pf_helper.log 2>&1 &)",
+        rules = rules_escaped,
+        anchor = ANCHOR_NAME,
+        exe = exe_path,
+        pid_path = pf_helper::PID_PATH,
+        sock_path = pf_helper::SOCKET_PATH,
     );
 
     tracing::info!(rules = %rules, "installing pf rules and launching helper");
@@ -254,16 +257,19 @@ fn install_pf_rules(
 }
 
 /// Flush pf anchor rules, stop the helper, and restore the original main ruleset.
+/// Helper kill is done via osascript (root) to avoid EPERM (Fix #5).
 fn flush_pf_rules() {
-    // Stop the privileged helper first
-    pf_helper::stop_pf_helper();
-
     let cmd = format!(
-        "pfctl -a {} -F all 2>&1; pfctl -f /etc/pf.conf 2>&1 || true",
-        ANCHOR_NAME,
+        "kill $(cat {pid_path} 2>/dev/null) 2>/dev/null; \
+         rm -f {sock_path} {pid_path}; \
+         pfctl -a {anchor} -F all 2>&1; \
+         pfctl -f /etc/pf.conf 2>&1 || true",
+        anchor = ANCHOR_NAME,
+        pid_path = pf_helper::PID_PATH,
+        sock_path = pf_helper::SOCKET_PATH,
     );
     match privilege::run_with_admin_privileges(&cmd) {
-        Ok(_) => tracing::info!(anchor = ANCHOR_NAME, "pf rules flushed and main config restored"),
+        Ok(_) => tracing::info!(anchor = ANCHOR_NAME, "pf rules flushed and helper stopped"),
         Err(e) => tracing::warn!(error = %e, "failed to flush pf rules (may need manual cleanup)"),
     }
 }

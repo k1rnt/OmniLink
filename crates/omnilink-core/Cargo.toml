@@ -15,6 +15,9 @@ ipnet = { workspace = true }
 regex = { workspace = true }
 russh = "0.46"
 async-trait = "0.1"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
 keyring = "3"
 dirs = "5"
 
