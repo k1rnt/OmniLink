@@ -274,9 +274,10 @@ mod macos {
 
         let path = String::from_utf8_lossy(&buf[..ret as usize]).to_string();
 
-        // Extract app bundle name if path contains .app/ (e.g., "Brave Browser.app/..." → "Brave Browser")
-        // This gives user-friendly names instead of helper process names like "Brave Browser Helper"
-        let name = if let Some(app_pos) = path.rfind(".app/") {
+        // Extract app bundle name from the outermost .app/ in the path.
+        // e.g., "/Applications/Brave Browser.app/.../Brave Browser Helper.app/..." → "Brave Browser"
+        // Using find() (not rfind) to get the top-level bundle, not a nested helper .app.
+        let name = if let Some(app_pos) = path.find(".app/") {
             let app_path = &path[..app_pos];
             if let Some(sep) = app_path.rfind('/') {
                 app_path[sep + 1..].to_string()
