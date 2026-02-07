@@ -15,15 +15,22 @@ OmniLink intercepts network traffic at the OS level and routes it through proxy 
 - **HTTP / HTTPS CONNECT** - HTTP tunnel proxy support
 - **SSH Tunnel** - Direct-tcpip channel forwarding via russh
 
+### Traffic Interception
+- **SOCKS5 Service** - Local SOCKS5 listener for application-level proxying (all platforms)
+- **Transparent Proxy (pf)** - macOS Packet Filter based transparent proxy (no Apple Developer account needed)
+- **Network Extension** - macOS NETransparentProxyProvider (requires Apple Developer account)
+- **eBPF** - Linux cgroup-based interception (connect4/sendmsg4 hooks)
+
 ### Routing & Rules
 - **Rule-Based Routing** - Route traffic based on process name, destination domain/IP (CIDR), port range, or user
 - **Proxy Chains** - Chain multiple proxies with strict, failover, round-robin, or random selection modes
 - **Virtual DNS (Fake IP)** - Prevents DNS leaks by mapping domains to a private IP pool (`198.18.0.0/15`)
+- **Process Detection** - Automatic process identification via libproc + lsof fallback (macOS), /proc (Linux), OpenProcess (Windows)
 
 ### Management
 - **Proxy Checker** - Built-in latency and connectivity checker
 - **Profile System** - Save and switch between named configuration profiles
-- **Connection Monitor** - Real-time connection list with filtering, search, process name detection, and traffic statistics
+- **Connection Monitor** - Real-time connection list with filtering, search, process name detection, and live traffic statistics
 - **Traffic Visualization** - Real-time bandwidth graph with per-proxy and per-domain statistics
 - **Secure Credential Storage** - OS keychain integration (macOS Keychain, Windows Credential Manager, Linux Secret Service)
 - **System Proxy** - Automatic system-wide proxy configuration (auto-disables on service stop)
@@ -33,26 +40,49 @@ OmniLink intercepts network traffic at the OS level and routes it through proxy 
 - **Cross-Platform UI** - Tauri + React desktop application
 - **Full CRUD Operations** - Create, edit, delete rules, proxies, and chains from the UI
 - **Connection Control** - Terminate active connections from the UI
-- **Apps Browser** - View installed applications and use app selector for easy process-based rule creation
-- **Native File Dialogs** - Load/export configuration via OS file picker (Finder, Explorer, etc.)
-- **Close Confirmation** - Prompts to export config before quitting
-- **YAML Export** - Export rules to YAML format
+- **Apps Browser** - View installed applications and create process-based rules with one click
+- **Operating Mode Guide** - Built-in explanation of SOCKS proxy vs transparent proxy modes
+- **Native File Dialogs** - Load/export configuration via OS file picker
 - **Self-Update** - Manual update check and install from Settings tab
+- **YAML Export** - Export rules to YAML format
+
+## Operating Modes
+
+### Mode A: SOCKS Proxy (All Platforms)
+
+Standard proxy mode. Applications connect through OmniLink's local SOCKS5 listener.
+
+1. Start SOCKS Service (toolbar button)
+2. Configure apps to use SOCKS5 proxy (`127.0.0.1:1080`), or enable System Proxy in Settings
+
+Best for: Burp Suite integration, per-app proxy configuration, cross-platform use.
+
+### Mode B: Transparent Proxy / pf (macOS)
+
+OS-level traffic interception. All TCP traffic is automatically redirected — no per-app configuration needed.
+
+1. Start Transparent Proxy (pf) in Settings
+2. Administrator password required for pf rule installation
+
+Note: SOCKS Service is **not needed** for this mode. Running both SOCKS + pf simultaneously may cause routing loops.
 
 ## Architecture
 
 ```
 +----------------------------------+
 |     UI Layer (Tauri + React)     |
+|  Connections | Rules | Proxies   |
+|  Traffic | Apps | Settings       |
 +----------------------------------+
 |    Core Engine (Rust / Tokio)    |
-|  +--------+ +------+ +--------+  |
-|  | Proxy  | | Rule | |  DNS   |  |
-|  | Client | |Engine| |Resolver|  |
-|  +--------+ +------+ +--------+  |
+|  +--------+ +------+ +--------+ |
+|  | Proxy  | | Rule | |  DNS   | |
+|  | Client | |Engine| |Resolver| |
+|  +--------+ +------+ +--------+ |
 +----------------------------------+
 |     OS Interceptor (Native)      |
-|  Win: WFP  macOS: NE  Linux: eBPF|
+|  macOS: pf/NE  Linux: eBPF      |
+|  Windows: WFP (planned)         |
 +----------------------------------+
 ```
 
@@ -68,15 +98,21 @@ OmniLink/
 │   │       ├── dns/         # Virtual DNS / Fake IP
 │   │       ├── config/      # Configuration and profiles
 │   │       ├── credential/  # OS keychain integration
+│   │       ├── app_discovery.rs  # Installed app scanner
 │   │       ├── checker.rs   # Proxy latency checker
 │   │       └── session.rs   # Connection session tracking
-│   ├── omnilink-tun/        # TUN device + packet parsing
-│   ├── omnilink-ebpf/       # Linux eBPF interceptor
+│   ├── omnilink-tun/        # Traffic interception
+│   │   └── src/
+│   │       ├── macos/       # pf interceptor, NE interceptor, utun
+│   │       ├── linux/       # eBPF interceptor, TUN
+│   │       ├── windows/     # WFP interceptor (stub)
+│   │       └── process.rs   # Cross-platform process detection
+│   ├── omnilink-ebpf/       # Linux eBPF programs
 │   └── omnilink-cli/        # CLI binary
 ├── omnilink-ui/             # Tauri + React frontend
 │   ├── src/                 # React components
 │   └── src-tauri/           # Tauri Rust backend
-├── omnilink-ne/             # macOS Network Extension (NETransparentProxyProvider)
+├── omnilink-ne/             # macOS Network Extension
 ├── omnilink-wfp/            # Windows WFP driver + service
 ├── config.example.yaml      # Example configuration
 └── Cargo.toml               # Workspace root
@@ -138,8 +174,6 @@ proxies:
     protocol: !Socks5
     address: "proxy.example.com"
     port: 1080
-    # Credentials stored in OS keychain. Set with:
-    #   omnilink credential set my-socks5 -u user -p pass
     has_auth: true
 
   - name: my-http
@@ -185,7 +219,7 @@ rules:
 
   - name: proxy-browsers
     conditions:
-      - !process_name "chrome.exe;firefox.exe;safari"
+      - !process_name "Brave Browser;Google Chrome;firefox"
     action:
       !proxy my-socks5
     priority: 50
@@ -235,19 +269,19 @@ dns:
 
 ## Platform Support
 
-| Platform | Interception Method | SOCKS Listener | OS Interceptor |
-|----------|---------------------|---------------|----------------|
-| macOS | Network Extension (NETransparentProxyProvider) | Stable | Basic implementation |
-| Linux | eBPF (connect4/sendmsg4 hooks) | Stable | Basic implementation |
-| Windows | WFP (Windows Filtering Platform) | Stable | Skeleton |
-
-The SOCKS5 listener works on all platforms. OS-level interception (transparent proxying without per-app configuration) is under active development.
+| Platform | SOCKS Listener | Transparent Proxy | Process Detection |
+|----------|---------------|-------------------|-------------------|
+| macOS | Stable | pf (stable), NE (requires Apple Developer) | libproc + lsof fallback |
+| Linux | Stable | eBPF (basic implementation) | /proc/net/tcp scanning |
+| Windows | Stable | WFP (skeleton) | OpenProcess API |
 
 ### Platform-Specific Notes
 
 **macOS:**
-- Network Extension requires System Extension approval and app notarization for distribution
-- Process name detection via libproc FFI
+- **pf interceptor** requires administrator privileges (prompted via dialog). No Apple Developer account needed.
+- Network Extension requires System Extension approval and app notarization
+- Process detection: libproc FFI for own-process sockets, lsof fallback for cross-process detection
+- App bundle name extraction: helper processes (e.g., "Brave Browser Helper") are mapped to their parent app name (e.g., "Brave Browser")
 - Universal Binary (arm64 + x86_64) supported
 
 **Linux:**
