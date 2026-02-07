@@ -273,10 +273,22 @@ mod macos {
         }
 
         let path = String::from_utf8_lossy(&buf[..ret as usize]).to_string();
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.clone());
+
+        // Extract app bundle name if path contains .app/ (e.g., "Brave Browser.app/..." → "Brave Browser")
+        // This gives user-friendly names instead of helper process names like "Brave Browser Helper"
+        let name = if let Some(app_pos) = path.rfind(".app/") {
+            let app_path = &path[..app_pos];
+            if let Some(sep) = app_path.rfind('/') {
+                app_path[sep + 1..].to_string()
+            } else {
+                app_path.to_string()
+            }
+        } else {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        };
 
         cache
             .entries
@@ -404,6 +416,70 @@ mod macos {
         true
     }
 
+    /// Fallback: use `lsof` to look up the process owning a TCP socket.
+    ///
+    /// `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` requires elevated privileges
+    /// on macOS to inspect other processes' sockets. `lsof` has the necessary
+    /// entitlements and works reliably.
+    fn lookup_lsof(target: &SocketAddrV4) -> Option<ProcessInfo> {
+        let addr_arg = format!("TCP@{}:{}", target.ip(), target.port());
+        let output = std::process::Command::new("lsof")
+            .args(["-i", &addr_arg, "-P", "-n", "-F", "pc"])
+            .output()
+            .ok()?;
+
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        if !output.status.success() {
+            return None;
+        }
+        let my_pid = std::process::id();
+
+        // Parse all (pid, cmd) pairs from lsof output.
+        // lsof -F pc outputs: p<pid>\nc<cmd>\nf<fd>\n... for each process.
+        let mut current_pid: Option<u32> = None;
+        let mut current_cmd: Option<String> = None;
+
+        for line in text.lines() {
+            if let Some(p) = line.strip_prefix('p') {
+                // If we had a previous entry, check if it's valid
+                if let Some(pid) = current_pid {
+                    if pid != my_pid {
+                        return resolve_lsof_result(pid, current_cmd.take());
+                    }
+                }
+                current_pid = p.parse().ok();
+                current_cmd = None;
+            } else if let Some(c) = line.strip_prefix('c') {
+                current_cmd = Some(c.to_string());
+            }
+        }
+
+        // Check the last entry
+        if let Some(pid) = current_pid {
+            if pid != my_pid {
+                return resolve_lsof_result(pid, current_cmd);
+            }
+        }
+
+        None
+    }
+
+    fn resolve_lsof_result(pid: u32, cmd: Option<String>) -> Option<ProcessInfo> {
+        // Use proc_pidpath for the full path (more reliable than lsof command name)
+        if let Some((name, path)) = cached_pid_path(pid) {
+            Some(ProcessInfo { pid, name, path })
+        } else {
+            // Fall back to lsof command name
+            let name = cmd.unwrap_or_else(|| "unknown".to_string());
+            Some(ProcessInfo {
+                pid,
+                name: name.clone(),
+                path: name,
+            })
+        }
+    }
+
     pub(super) fn lookup(local_addr: &SocketAddr) -> Option<ProcessInfo> {
         let target = match local_addr {
             SocketAddr::V4(v4) => *v4,
@@ -417,6 +493,7 @@ mod macos {
             }
         };
 
+        // Try proc_pidfdinfo first (fast, works for own process)
         let pids = list_all_pids()?;
         let my_pid = std::process::id() as libc::pid_t;
 
@@ -446,7 +523,8 @@ mod macos {
             }
         }
 
-        None
+        // Fallback: use lsof (slower but works with macOS security restrictions)
+        lookup_lsof(&target)
     }
 }
 
@@ -609,5 +687,50 @@ mod tests {
             assert!(!info.path.is_empty());
         }
         // If None, we might not have permissions (CI, sandbox, etc.) - that's OK
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_lookup_external_client_socket() {
+        // Test that lsof fallback finds a client socket from another process
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let child = std::process::Command::new("nc")
+            .args(["-w", "10", "127.0.0.1", &listen_addr.port().to_string()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+
+        let child = match child {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("nc not available, skipping test");
+                return;
+            }
+        };
+
+        let (_stream, peer_addr) = listener.accept().unwrap();
+
+        // Small delay to ensure nc's connection is fully registered in the kernel
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let start = std::time::Instant::now();
+        let result = lookup_process_by_socket(&peer_addr);
+        let elapsed = start.elapsed();
+
+        eprintln!("External client socket lookup: peer={} child_pid={} elapsed={:?}",
+            peer_addr, child.id(), elapsed);
+        match &result {
+            Some(info) => {
+                eprintln!("  FOUND: pid={} name={} path={}", info.pid, info.name, info.path);
+                assert_eq!(info.pid, child.id());
+            }
+            None => {
+                eprintln!("  NOT FOUND (lsof fallback may not be available)");
+            }
+        }
+
+        drop(child);
     }
 }
