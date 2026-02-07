@@ -6,6 +6,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use async_trait::async_trait;
 use tokio::net::TcpListener;
@@ -18,6 +19,33 @@ use super::privilege;
 
 const ANCHOR_NAME: &str = "com.omnilink";
 
+/// Start of the source port range used by OmniLink's outbound connections.
+/// pf rules exclude this range to prevent re-interception loops.
+pub const BYPASS_PORT_START: u16 = 50000;
+/// End of the source port range (inclusive).
+pub const BYPASS_PORT_END: u16 = 50999;
+
+static BYPASS_PORT_COUNTER: AtomicU16 = AtomicU16::new(BYPASS_PORT_START);
+
+/// Allocate the next source port from the bypass range (50000-50999).
+/// Wraps around when the range is exhausted.
+pub fn next_bypass_port() -> u16 {
+    loop {
+        let current = BYPASS_PORT_COUNTER.load(Ordering::Relaxed);
+        let next = if current >= BYPASS_PORT_END {
+            BYPASS_PORT_START
+        } else {
+            current + 1
+        };
+        if BYPASS_PORT_COUNTER
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return current;
+        }
+    }
+}
+
 /// macOS interceptor using pf (Packet Filter) for transparent TCP redirection.
 pub struct PfInterceptor {
     running: bool,
@@ -29,8 +57,6 @@ pub struct PfInterceptor {
     pf_fd: Option<RawFd>,
     /// Handle for the spawned accept loop task.
     abort_handle: Option<tokio::task::JoinHandle<()>>,
-    /// UID of the current process (for loop avoidance in pf rules).
-    self_uid: u32,
     /// The listener port allocated during start.
     listener_port: u16,
 }
@@ -43,7 +69,6 @@ impl PfInterceptor {
             interface: None,
             pf_fd: None,
             abort_handle: None,
-            self_uid: unsafe { libc::getuid() },
             listener_port: 0,
         }
     }
@@ -76,7 +101,7 @@ impl Interceptor for PfInterceptor {
         tracing::info!(port = self.listener_port, "pf TCP listener bound");
 
         // 3. Install pf anchor rules (also makes /dev/pf readable for DIOCNATLOOK)
-        install_pf_rules(&iface, self.listener_port, self.self_uid, &self.excluded_ips)?;
+        install_pf_rules(&iface, self.listener_port, &self.excluded_ips)?;
 
         // 4. Open /dev/pf (after install_pf_rules which chmod's it)
         let pf_fd = open_pf_dev()?;
@@ -177,7 +202,6 @@ fn open_pf_dev() -> Result<RawFd, InterceptorError> {
 fn install_pf_rules(
     iface: &str,
     listener_port: u16,
-    self_uid: u32,
     excluded_ips: &[Ipv4Addr],
 ) -> Result<(), InterceptorError> {
     let mut rules = String::new();
@@ -206,10 +230,17 @@ fn install_pf_rules(
         iface
     ));
 
-    // Route outbound TCP from non-self users through lo0
+    // Exclude OmniLink's own outbound connections (source port range 50000-50999)
+    // to prevent re-interception loops. OmniLink binds outbound sockets to this range.
     rules.push_str(&format!(
-        "pass out on {} route-to lo0 inet proto tcp from any to any user != {} keep state\n",
-        iface, self_uid
+        "pass out quick on {} proto tcp from any port {}:{} no state\n",
+        iface, BYPASS_PORT_START, BYPASS_PORT_END
+    ));
+
+    // Route ALL outbound TCP through lo0 for interception
+    rules.push_str(&format!(
+        "pass out on {} route-to lo0 inet proto tcp from any to any keep state\n",
+        iface
     ));
 
     // Escape newlines for printf (osascript cannot handle literal newlines in

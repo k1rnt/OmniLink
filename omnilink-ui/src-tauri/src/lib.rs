@@ -1683,11 +1683,35 @@ async fn handle_pf_connection(
         }
         Action::Direct => {
             session_manager.update_status(session_id, SessionStatus::Active);
-            let target = match &dest {
-                omnilink_core::proxy::ProxyDestination::SocketAddr(a) => a.to_string(),
-                omnilink_core::proxy::ProxyDestination::Domain(d, p) => format!("{}:{}", d, p),
+            let target: std::net::SocketAddr = match &dest {
+                omnilink_core::proxy::ProxyDestination::SocketAddr(a) => *a,
+                omnilink_core::proxy::ProxyDestination::Domain(d, p) => {
+                    // Resolve domain to IP for TcpSocket::connect
+                    match tokio::net::lookup_host(format!("{}:{}", d, p)).await {
+                        Ok(mut addrs) => match addrs.next() {
+                            Some(addr) => addr,
+                            None => {
+                                let msg = format!("DNS resolution failed for {}:{}", d, p);
+                                session_manager.update_status(session_id, SessionStatus::Error(msg.clone()));
+                                traffic_stats.record_connection_close();
+                                return Err(msg.into());
+                            }
+                        },
+                        Err(e) => {
+                            session_manager.update_status(session_id, SessionStatus::Error(e.to_string()));
+                            traffic_stats.record_connection_close();
+                            return Err(e.into());
+                        }
+                    }
+                }
             };
-            match tokio::net::TcpStream::connect(&target).await {
+            // Bind to a bypass source port so pf doesn't re-intercept this connection
+            let bypass_port = omnilink_tun::macos::pf_interceptor::next_bypass_port();
+            let socket = tokio::net::TcpSocket::new_v4()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            socket.bind(std::net::SocketAddr::from(([0, 0, 0, 0], bypass_port)))
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            match socket.connect(target).await {
                 Ok(mut outbound) => {
                     let (mut ri, mut wi) = inbound.split();
                     let (mut ro, mut wo) = outbound.split();
