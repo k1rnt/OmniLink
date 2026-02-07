@@ -137,8 +137,9 @@ fn detect_active_interface() -> Option<String> {
 
 /// Open /dev/pf for DIOCNATLOOK ioctl.
 ///
-/// Called AFTER `install_pf_rules` which `chmod o+r /dev/pf` with admin privileges.
-/// Returns -1 as sentinel if /dev/pf cannot be opened (fallback to pfctl -s state).
+/// Called AFTER `install_pf_rules` which `chmod o+rw /dev/pf` with admin privileges.
+/// Returns an error if /dev/pf cannot be opened (DIOCNATLOOK is required for
+/// transparent proxy to work — without it, original destinations are unknown).
 fn open_pf_dev() -> Result<RawFd, InterceptorError> {
     // Try read-write first (needed for DIOCNATLOOK on some macOS versions)
     let fd = unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::O_RDWR) };
@@ -155,8 +156,11 @@ fn open_pf_dev() -> Result<RawFd, InterceptorError> {
         return Ok(fd);
     }
 
-    tracing::warn!("could not open /dev/pf, will use pfctl -s state fallback for NAT lookup");
-    Ok(-1)
+    let err = std::io::Error::last_os_error();
+    Err(InterceptorError::RoutingSetup(format!(
+        "cannot open /dev/pf: {} (chmod may have failed during setup)",
+        err
+    )))
 }
 
 /// Install pf anchor rules for transparent TCP redirection.
@@ -212,14 +216,14 @@ fn install_pf_rules(
     // the AppleScript string — they break the `do shell script "…"` parsing).
     let rules_escaped = rules.replace('\'', "'\\''").replace('\n', "\\n");
 
-    // Step 1: Write anchor rules to temp file via printf, load with pfctl -a
-    // Step 2: Rebuild main ruleset from /etc/pf.conf with our anchor references
-    //         inserted at the correct positions (pf requires strict ordering:
-    //         scrub → nat → rdr → dummynet → filter → load).
-    // Step 3: Enable pf
-    // Step 4: Clean up temp files
+    // The command is structured so that:
+    // - pfctl commands are chained with && (fail-fast)
+    // - pfctl -e uses || true (OK if pf already enabled)
+    // - chmod runs last to determine the exit code
+    // - temp files cleaned up via trap (doesn't affect exit code)
     let cmd = format!(
-        "printf '{}' > /tmp/omnilink_pf_anchor.conf && \
+        "trap 'rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf' EXIT; \
+         printf '{}' > /tmp/omnilink_pf_anchor.conf && \
          pfctl -a {} -f /tmp/omnilink_pf_anchor.conf 2>&1 && \
          {{ grep '^scrub-anchor' /etc/pf.conf 2>/dev/null; \
          grep '^nat-anchor' /etc/pf.conf 2>/dev/null; \
@@ -231,20 +235,31 @@ fn install_pf_rules(
          grep '^load' /etc/pf.conf 2>/dev/null; \
          true; }} > /tmp/omnilink_pf_main.conf && \
          pfctl -f /tmp/omnilink_pf_main.conf 2>&1 && \
-         pfctl -e 2>&1; \
-         chmod o+rw /dev/pf 2>&1; \
-         rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf",
+         (pfctl -e 2>&1 || true) && \
+         chmod o+rw /dev/pf 2>&1",
         rules_escaped,
         ANCHOR_NAME,
         ANCHOR_NAME,
         ANCHOR_NAME,
     );
 
-    tracing::debug!(rules = %rules, "installing pf rules with anchor references");
+    tracing::info!(rules = %rules, "installing pf rules");
 
-    privilege::run_with_admin_privileges(&cmd).map_err(|e| {
+    let output = privilege::run_with_admin_privileges(&cmd).map_err(|e| {
         InterceptorError::RoutingSetup(format!("failed to install pf rules: {}", e))
     })?;
+
+    tracing::info!(output = %output.trim(), "pf admin command output");
+
+    // Verify /dev/pf is now accessible (chmod worked)
+    let pf_check = unsafe {
+        libc::access(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::R_OK)
+    };
+    if pf_check != 0 {
+        return Err(InterceptorError::RoutingSetup(
+            "/dev/pf is not readable after setup — admin command may have failed".to_string(),
+        ));
+    }
 
     tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules and references installed");
     Ok(())
@@ -279,16 +294,10 @@ async fn run_pf_accept_loop(
                     Err(_) => continue,
                 };
 
-                // Look up original destination via DIOCNATLOOK (primary)
-                let original_dst = if pf_fd >= 0 {
-                    lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr)
-                } else {
-                    None
-                };
-
-                // Fallback: parse pfctl -s state
+                // Look up original destination via DIOCNATLOOK
                 let original_dst =
-                    original_dst.or_else(|| lookup_original_dst_pfctl(&peer_addr));
+                    lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr)
+                        .or_else(|| lookup_original_dst_pfctl(&peer_addr));
 
                 let Some(original_dst) = original_dst else {
                     tracing::warn!(
