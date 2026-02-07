@@ -12,13 +12,6 @@ interface ProfileInfo {
   active: boolean;
 }
 
-interface NEStatusInfo {
-  installed: boolean;
-  enabled: boolean;
-  running: boolean;
-  server_running: boolean;
-}
-
 interface Props {
   state: AppState;
 }
@@ -38,7 +31,6 @@ function SettingsView({ state }: Props) {
   const [newProfileName, setNewProfileName] = useState("");
   const [appVersion, setAppVersion] = useState("");
   const [isMacOS] = useState(() => navigator.platform.toUpperCase().includes("MAC"));
-  const [neStatus, setNeStatus] = useState<NEStatusInfo>({ installed: false, enabled: false, running: false, server_running: false });
   const [pfStatus, setPfStatus] = useState(false);
   const { updateInfo, progress, error, checkForUpdates, downloadAndInstall, restartApp } = useUpdater();
 
@@ -64,16 +56,6 @@ function SettingsView({ state }: Props) {
     }
   }, []);
 
-  const fetchNeStatus = useCallback(async () => {
-    if (!isMacOS) return;
-    try {
-      const status = await invoke<NEStatusInfo>("get_ne_status");
-      setNeStatus(status);
-    } catch (e) {
-      console.error("Failed to fetch NE status:", e);
-    }
-  }, [isMacOS]);
-
   const fetchPfStatus = useCallback(async () => {
     if (!isMacOS) return;
     try {
@@ -87,9 +69,8 @@ function SettingsView({ state }: Props) {
   useEffect(() => {
     fetchSysproxy();
     fetchProfiles();
-    fetchNeStatus();
     fetchPfStatus();
-  }, [fetchSysproxy, fetchProfiles, fetchNeStatus, fetchPfStatus]);
+  }, [fetchSysproxy, fetchProfiles, fetchPfStatus]);
 
   const showMessage = (msg: string) => {
     if (msg.toLowerCase().startsWith("error")) {
@@ -148,6 +129,31 @@ function SettingsView({ state }: Props) {
 
   return (
     <div className="settings-panel">
+      <div className="setting-group">
+        <h3>Operating Modes</h3>
+        <div className="setting-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: 8 }}>
+          <div>
+            <strong style={{ fontSize: 12 }}>Mode A: SOCKS Proxy</strong>
+            <p style={{ fontSize: 11, color: "var(--text-secondary)", margin: "2px 0 0 0" }}>
+              Start SOCKS Service (top-right button), then enable System Proxy below or configure apps to use SOCKS.
+            </p>
+          </div>
+          <div>
+            <strong style={{ fontSize: 12 }}>Mode B: Transparent Proxy (pf) — macOS only</strong>
+            <p style={{ fontSize: 11, color: "var(--text-secondary)", margin: "2px 0 0 0" }}>
+              Start Transparent Proxy (pf) below. SOCKS Service is NOT needed. All TCP traffic is intercepted automatically.
+            </p>
+          </div>
+        </div>
+        {state.running && pfStatus && (
+          <div className="setting-row" style={{ borderColor: "var(--warning)" }}>
+            <span className="setting-label" style={{ fontSize: 11, color: "var(--warning)" }}>
+              Both SOCKS Service and pf are active. This may cause routing conflicts. Use only one mode at a time.
+            </span>
+          </div>
+        )}
+      </div>
+
       <div className="setting-group">
         <h3>Updates</h3>
         <div className="setting-row">
@@ -277,40 +283,6 @@ function SettingsView({ state }: Props) {
           </div>
         </div>
       </div>
-
-      {isMacOS && (
-        <div className="setting-group" style={{ opacity: 0.5 }}>
-          <h3>Network Extension (macOS)</h3>
-          <div className="setting-row">
-            <span className="setting-label">Extension Status</span>
-            <span className="setting-value">Not Available</span>
-          </div>
-          <div className="setting-row">
-            <span className="setting-label">NE Server</span>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <span className="setting-value">
-                {neStatus.server_running ? "Running" : "Stopped"}
-              </span>
-              <button
-                className="btn"
-                style={{ padding: "3px 10px", fontSize: 11 }}
-                disabled
-              >
-                {neStatus.server_running ? "Stop" : "Start"}
-              </button>
-            </div>
-          </div>
-          <div className="setting-row">
-            <span
-              className="setting-label"
-              style={{ fontSize: 11, color: "var(--text-secondary)" }}
-            >
-              Requires Apple Developer Program membership.
-              Use "Transparent Proxy (pf)" below instead.
-            </span>
-          </div>
-        </div>
-      )}
 
       {isMacOS && (
         <div className="setting-group">

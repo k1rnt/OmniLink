@@ -231,7 +231,7 @@ fn install_pf_rules(
          grep '^load' /etc/pf.conf 2>/dev/null; \
          true; }} > /tmp/omnilink_pf_main.conf && \
          pfctl -f /tmp/omnilink_pf_main.conf 2>&1 && \
-         pfctl -e 2>&1 && \
+         pfctl -e 2>&1; \
          chmod o+rw /dev/pf 2>&1; \
          rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf",
         rules_escaped,

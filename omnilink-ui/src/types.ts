@@ -43,6 +43,7 @@ export interface AppState {
   total_connections: number;
   active_connections: number;
   dns_mode: string;
+  pf_running: boolean;
 }
 
 export interface ApplicationInfo {

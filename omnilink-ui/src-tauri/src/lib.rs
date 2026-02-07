@@ -81,6 +81,7 @@ pub struct StatusInfo {
     pub total_sent: u64,
     pub total_received: u64,
     pub dns_mode: String,
+    pub pf_running: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +145,8 @@ async fn get_status(state: State<'_, SharedState>) -> Result<StatusInfo, String>
         .map(|c| format!("{:?}", c.dns.mode))
         .unwrap_or_else(|| "FakeIp".to_string());
 
+    let pf_running = state.pf_interceptor_running;
+
     Ok(StatusInfo {
         running: state.running,
         listen_addr,
@@ -152,6 +155,7 @@ async fn get_status(state: State<'_, SharedState>) -> Result<StatusInfo, String>
         total_sent: snapshot.total_sent,
         total_received: snapshot.total_received,
         dns_mode,
+        pf_running,
     })
 }
 

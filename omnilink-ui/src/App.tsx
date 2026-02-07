@@ -22,17 +22,19 @@ function App() {
     total_connections: 0,
     active_connections: 0,
     dns_mode: "FakeIp",
+    pf_running: false,
   });
 
   const fetchStatus = useCallback(async () => {
     try {
-      const status = await invoke<AppState & { total_sent: number; total_received: number }>("get_status");
+      const status = await invoke<AppState & { total_sent: number; total_received: number; pf_running: boolean }>("get_status");
       setAppState({
         running: status.running,
         listen_addr: status.listen_addr,
         total_connections: status.total_connections,
         active_connections: status.active_connections,
         dns_mode: status.dns_mode,
+        pf_running: status.pf_running,
       });
     } catch (e) {
       console.error("Failed to fetch status:", e);
@@ -92,7 +94,7 @@ function App() {
         <div className="toolbar-actions">
           <div className="status-indicator">
             <span className={`status-dot ${appState.running ? "active" : ""}`} />
-            {appState.running ? "Running" : "Stopped"}
+            SOCKS {appState.running ? "Running" : "Stopped"}
           </div>
           <button className={`btn ${appState.running ? "" : "btn-primary"}`} onClick={toggleService}>
             {appState.running ? "Stop" : "Start"}
@@ -122,7 +124,7 @@ function App() {
       </div>
 
       <div className="status-bar">
-        <span>Listen: {appState.listen_addr}</span>
+        <span>SOCKS: {appState.running ? "ON" : "OFF"} | pf: {appState.pf_running ? "ON" : "OFF"}</span>
         <span>Active: {appState.active_connections} | Total: {appState.total_connections}</span>
         <span>DNS: {appState.dns_mode}</span>
       </div>
