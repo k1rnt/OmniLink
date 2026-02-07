@@ -61,6 +61,15 @@ pub fn create_pf_interceptor(
     Box::new(macos::pf_interceptor::PfInterceptor::new(excluded_ips))
 }
 
+/// Run the privileged pf helper (DIOCNATLOOK server).
+///
+/// This should be called when the binary is invoked with `--pf-helper`.
+/// The function blocks and serves queries until the process is killed.
+#[cfg(target_os = "macos")]
+pub fn run_pf_helper() {
+    macos::pf_helper::run_pf_helper();
+}
+
 #[cfg(target_os = "linux")]
 pub fn create_interceptor(
     virtual_dns: std::sync::Arc<omnilink_core::dns::VirtualDns>,

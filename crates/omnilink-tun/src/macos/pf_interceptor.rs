@@ -4,8 +4,7 @@
 //! queries the original destination via DIOCNATLOOK ioctl on /dev/pf.
 //! Requires administrator privileges for pfctl and /dev/pf access.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::os::unix::io::RawFd;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use async_trait::async_trait;
@@ -14,7 +13,8 @@ use tokio::sync::mpsc;
 
 use crate::interceptor::{InterceptedConnection, Interceptor, InterceptorError, InterceptorEvent};
 
-use super::pf_sys;
+use super::pf_helper;
+use super::pf_sys; // PF_IN, PF_OUT constants used in accept loop
 use super::privilege;
 
 const ANCHOR_NAME: &str = "com.omnilink";
@@ -53,8 +53,6 @@ pub struct PfInterceptor {
     excluded_ips: Vec<Ipv4Addr>,
     /// Network interface to intercept (auto-detected if None).
     interface: Option<String>,
-    /// File descriptor for /dev/pf (opened during start via privileged helper).
-    pf_fd: Option<RawFd>,
     /// Handle for the spawned accept loop task.
     abort_handle: Option<tokio::task::JoinHandle<()>>,
     /// The listener port allocated during start.
@@ -67,7 +65,6 @@ impl PfInterceptor {
             running: false,
             excluded_ips,
             interface: None,
-            pf_fd: None,
             abort_handle: None,
             listener_port: 0,
         }
@@ -100,18 +97,14 @@ impl Interceptor for PfInterceptor {
         self.listener_port = local_addr.port();
         tracing::info!(port = self.listener_port, "pf TCP listener bound");
 
-        // 3. Install pf anchor rules (also makes /dev/pf readable for DIOCNATLOOK)
+        // 3. Install pf anchor rules and launch privileged DIOCNATLOOK helper
         install_pf_rules(&iface, self.listener_port, &self.excluded_ips)?;
 
-        // 4. Open /dev/pf (after install_pf_rules which chmod's it)
-        let pf_fd = open_pf_dev()?;
-        self.pf_fd = Some(pf_fd);
-
-        // 5. Spawn accept loop
+        // 4. Spawn accept loop (queries helper via Unix socket for original dst)
         let (tx, rx) = mpsc::channel(256);
 
         let handle = tokio::spawn(async move {
-            run_pf_accept_loop(listener, pf_fd, tx).await;
+            run_pf_accept_loop(listener, tx).await;
         });
 
         self.abort_handle = Some(handle);
@@ -126,15 +119,8 @@ impl Interceptor for PfInterceptor {
             handle.abort();
         }
 
-        // 2. Flush pf anchor rules
+        // 2. Flush pf anchor rules and stop helper
         flush_pf_rules();
-
-        // 3. Close /dev/pf fd
-        if let Some(fd) = self.pf_fd.take() {
-            unsafe {
-                libc::close(fd);
-            }
-        }
 
         self.running = false;
         tracing::info!("pf interceptor stopped, rules flushed");
@@ -160,45 +146,12 @@ fn detect_active_interface() -> Option<String> {
     None
 }
 
-/// Open /dev/pf for DIOCNATLOOK ioctl.
+/// Install pf anchor rules and launch the privileged DIOCNATLOOK helper.
 ///
-/// Called AFTER `install_pf_rules` which `chmod o+rw /dev/pf` with admin privileges.
-/// Returns an error if /dev/pf cannot be opened (DIOCNATLOOK is required for
-/// transparent proxy to work — without it, original destinations are unknown).
-fn open_pf_dev() -> Result<RawFd, InterceptorError> {
-    // Try read-write first (needed for DIOCNATLOOK on some macOS versions)
-    let fd = unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::O_RDWR) };
-    if fd >= 0 {
-        tracing::info!("/dev/pf opened (rw)");
-        return Ok(fd);
-    }
-
-    // Try read-only
-    let fd =
-        unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::O_RDONLY) };
-    if fd >= 0 {
-        tracing::info!("/dev/pf opened (ro)");
-        return Ok(fd);
-    }
-
-    let err = std::io::Error::last_os_error();
-    Err(InterceptorError::RoutingSetup(format!(
-        "cannot open /dev/pf: {} (chmod may have failed during setup)",
-        err
-    )))
-}
-
-/// Install pf anchor rules for transparent TCP redirection.
-///
-/// Two steps are required:
+/// Everything runs in a single `osascript` admin command (one password prompt):
 /// 1. Load rules into the named anchor (`pfctl -a <anchor> -f -`)
-/// 2. Add `rdr-anchor` and `anchor` references to the **main** ruleset so that
-///    pf actually evaluates our anchor. macOS's default `/etc/pf.conf` only
-///    references `com.apple/*`, so without this step the anchor is loaded but
-///    never evaluated.
-///
-/// We reload the main ruleset from `/etc/pf.conf` plus our anchor references
-/// via `pfctl -f -` (in-memory only; `/etc/pf.conf` is never modified).
+/// 2. Add `rdr-anchor` and `anchor` references to the main ruleset
+/// 3. Launch the privileged helper as a background root process
 fn install_pf_rules(
     iface: &str,
     listener_port: u16,
@@ -209,14 +162,12 @@ fn install_pf_rules(
     // pf requires rules in order: translation (rdr/nat) THEN filter (pass/block).
 
     // --- Translation rules (rdr) ---
-    // Redirect traffic arriving on lo0 (via route-to) to our listener
     rules.push_str(&format!(
         "rdr pass on lo0 proto tcp from any to any -> 127.0.0.1 port {}\n",
         listener_port
     ));
 
     // --- Filter rules (pass) ---
-    // Exclude proxy server IPs to prevent loops
     for ip in excluded_ips {
         rules.push_str(&format!(
             "pass out quick on {} proto tcp from any to {} no state\n",
@@ -224,34 +175,36 @@ fn install_pf_rules(
         ));
     }
 
-    // Don't redirect traffic to localhost (our own listener, Burp, etc.)
     rules.push_str(&format!(
         "pass out quick on {} proto tcp from any to 127.0.0.0/8 no state\n",
         iface
     ));
 
-    // Exclude OmniLink's own outbound connections (source port range 50000-50999)
-    // to prevent re-interception loops. OmniLink binds outbound sockets to this range.
     rules.push_str(&format!(
         "pass out quick on {} proto tcp from any port {}:{} no state\n",
         iface, BYPASS_PORT_START, BYPASS_PORT_END
     ));
 
-    // Route ALL outbound TCP through lo0 for interception
     rules.push_str(&format!(
         "pass out on {} route-to lo0 inet proto tcp from any to any keep state\n",
         iface
     ));
 
-    // Escape newlines for printf (osascript cannot handle literal newlines in
-    // the AppleScript string — they break the `do shell script "…"` parsing).
     let rules_escaped = rules.replace('\'', "'\\''").replace('\n', "\\n");
 
-    // The command is structured so that:
-    // - pfctl commands are chained with && (fail-fast)
-    // - pfctl -e uses || true (OK if pf already enabled)
-    // - chmod runs last to determine the exit code
-    // - temp files cleaned up via trap (doesn't affect exit code)
+    // Get path to current executable for launching the helper
+    let exe_path = std::env::current_exe()
+        .map_err(|e| {
+            InterceptorError::RoutingSetup(format!("cannot determine executable path: {}", e))
+        })?
+        .display()
+        .to_string()
+        .replace('\'', "'\\''");
+
+    // Kill any existing helper before launching a new one
+    pf_helper::stop_pf_helper();
+
+    // Single admin command: pfctl setup + helper launch (one password prompt)
     let cmd = format!(
         "trap 'rm -f /tmp/omnilink_pf_anchor.conf /tmp/omnilink_pf_main.conf' EXIT; \
          printf '{}' > /tmp/omnilink_pf_anchor.conf && \
@@ -267,63 +220,46 @@ fn install_pf_rules(
          true; }} > /tmp/omnilink_pf_main.conf && \
          pfctl -f /tmp/omnilink_pf_main.conf 2>&1 && \
          (pfctl -e 2>&1 || true) && \
-         chmod o+rw /dev/pf 2>&1",
+         ('{}' --pf-helper </dev/null >/tmp/omnilink_pf_helper.log 2>&1 &)",
         rules_escaped,
         ANCHOR_NAME,
         ANCHOR_NAME,
         ANCHOR_NAME,
+        exe_path,
     );
 
-    tracing::info!(rules = %rules, "installing pf rules");
+    tracing::info!(rules = %rules, "installing pf rules and launching helper");
 
     let output = privilege::run_with_admin_privileges(&cmd).map_err(|e| {
         InterceptorError::RoutingSetup(format!("failed to install pf rules: {}", e))
     })?;
 
     tracing::info!(output = %output.trim(), "pf admin command output");
+    tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules installed");
 
-    // Verify /dev/pf is now accessible (chmod worked)
-    let pf_check = unsafe {
-        libc::access(b"/dev/pf\0".as_ptr() as *const libc::c_char, libc::R_OK)
-    };
-    if pf_check != 0 {
-        return Err(InterceptorError::RoutingSetup(
-            "/dev/pf is not readable after setup — admin command may have failed".to_string(),
-        ));
-    }
-
-    tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules and references installed");
-
-    // Verify rules are actually loaded in the anchor.
-    // Note: pfctl requires root to read anchor rules, so only error if the
-    // command succeeds (exit 0) but returns empty output.
-    if let Ok(verify_out) = std::process::Command::new("pfctl")
-        .args(["-a", ANCHOR_NAME, "-sr"])
-        .output()
-    {
-        if verify_out.status.success() {
-            let loaded_rules = String::from_utf8_lossy(&verify_out.stdout);
-            if loaded_rules.trim().is_empty() {
-                return Err(InterceptorError::RoutingSetup(
-                    "pf anchor rules are empty after installation".to_string(),
-                ));
-            }
-            tracing::info!(rules = %loaded_rules.trim(), "pf anchor rules verified");
-        } else {
-            tracing::info!("pf anchor rules installed (verification skipped — needs root)");
+    // Wait for the helper socket to appear (up to 3 seconds)
+    for _ in 0..30 {
+        if pf_helper::is_helper_running() {
+            tracing::info!("pf privileged helper is running");
+            return Ok(());
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    Ok(())
+    // Helper didn't start — flush rules to avoid network outage
+    flush_pf_rules();
+    Err(InterceptorError::RoutingSetup(
+        "pf helper did not start within 3 seconds (rules flushed for safety)".to_string(),
+    ))
 }
 
-/// Flush pf anchor rules and restore the original main ruleset (best-effort).
-///
-/// 1. Flush all rules inside our anchor.
-/// 2. Reload `/etc/pf.conf` into the main ruleset to remove our anchor references.
+/// Flush pf anchor rules, stop the helper, and restore the original main ruleset.
 fn flush_pf_rules() {
+    // Stop the privileged helper first
+    pf_helper::stop_pf_helper();
+
     let cmd = format!(
-        "pfctl -a {} -F all 2>&1; pfctl -f /etc/pf.conf 2>&1; chmod 600 /dev/pf 2>&1 || true",
+        "pfctl -a {} -F all 2>&1; pfctl -f /etc/pf.conf 2>&1 || true",
         ANCHOR_NAME,
     );
     match privilege::run_with_admin_privileges(&cmd) {
@@ -332,10 +268,10 @@ fn flush_pf_rules() {
     }
 }
 
-/// Accept loop: accepts redirected connections and emits InterceptorEvents.
+/// Accept loop: accepts redirected connections and queries the privileged helper
+/// for the original destination via Unix socket IPC.
 async fn run_pf_accept_loop(
     listener: TcpListener,
-    pf_fd: RawFd,
     tx: mpsc::Sender<InterceptorEvent>,
 ) {
     loop {
@@ -352,14 +288,16 @@ async fn run_pf_accept_loop(
                     "pf: accepted connection, looking up original destination"
                 );
 
-                // Try DIOCNATLOOK with both directions (PF_IN for rdr, PF_OUT for nat)
-                let original_dst =
-                    lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr, pf_sys::PF_IN)
-                        .or_else(|| lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr, pf_sys::PF_OUT))
+                // Query the privileged helper for DIOCNATLOOK (runs as root)
+                let original_dst = tokio::task::spawn_blocking(move || {
+                    pf_helper::query_original_dst(&peer_addr, &local_addr, pf_sys::PF_IN)
                         .or_else(|| {
-                            tracing::info!("DIOCNATLOOK failed both directions, trying pfctl -s state");
-                            lookup_original_dst_pfctl(&peer_addr, local_addr.port())
-                        });
+                            pf_helper::query_original_dst(&peer_addr, &local_addr, pf_sys::PF_OUT)
+                        })
+                })
+                .await
+                .ok()
+                .flatten();
 
                 let Some(original_dst) = original_dst else {
                     tracing::warn!(
@@ -370,14 +308,21 @@ async fn run_pf_accept_loop(
                     continue;
                 };
 
-                // Skip connections to our own listener (shouldn't happen, but safety check)
+                // Skip connections to our own listener
                 if original_dst == local_addr {
                     continue;
                 }
 
+                tracing::info!(
+                    peer = %peer_addr,
+                    dst = %original_dst,
+                    "pf: DIOCNATLOOK resolved original destination"
+                );
+
                 // Look up process info (lsof is blocking, so use spawn_blocking)
+                let peer_for_proc = peer_addr;
                 let proc_info = tokio::task::spawn_blocking(move || {
-                    crate::process::lookup_process_by_socket(&peer_addr)
+                    crate::process::lookup_process_by_socket(&peer_for_proc)
                 }).await.ok().flatten();
 
                 let conn = InterceptedConnection {
@@ -407,194 +352,4 @@ async fn run_pf_accept_loop(
             }
         }
     }
-}
-
-/// Look up the original destination using DIOCNATLOOK ioctl on /dev/pf.
-fn lookup_original_dst_ioctl(
-    pf_fd: RawFd,
-    peer_addr: &SocketAddr,
-    local_addr: &SocketAddr,
-    direction: u8,
-) -> Option<SocketAddr> {
-    let (peer_v4, peer_port) = match peer_addr {
-        SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-        _ => return None,
-    };
-    let (local_v4, local_port) = match local_addr {
-        SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-        _ => return None,
-    };
-
-    let mut pnl = pf_sys::PfiocNatlook::default();
-    pnl.af = pf_sys::AF_INET;
-    pnl.proto = pf_sys::IPPROTO_TCP;
-    pnl.direction = direction;
-
-    // Source: the application's address
-    pnl.saddr.v4 = u32::from(peer_v4).to_be();
-    pnl.sxport.port = peer_port.to_be();
-
-    // Destination: our listener address (after rdr)
-    pnl.daddr.v4 = u32::from(local_v4).to_be();
-    pnl.dxport.port = local_port.to_be();
-
-    let dir_name = if direction == pf_sys::PF_IN { "PF_IN" } else { "PF_OUT" };
-
-    let ret = unsafe { libc::ioctl(pf_fd, pf_sys::diocnatlook_ioctl(), &mut pnl) };
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::info!(
-            dir = dir_name,
-            peer = %peer_addr,
-            local = %local_addr,
-            error = %err,
-            "DIOCNATLOOK failed"
-        );
-        return None;
-    }
-
-    // Extract result: real destination
-    let rd_ip = Ipv4Addr::from(u32::from_be(unsafe { pnl.rdaddr.v4 }));
-    let rd_port = u16::from_be(unsafe { pnl.rdxport.port });
-
-    tracing::info!(
-        dir = dir_name,
-        result_ip = %rd_ip,
-        result_port = rd_port,
-        "DIOCNATLOOK succeeded"
-    );
-
-    // Sanity check: result should differ from listener address
-    if rd_ip == local_v4 && rd_port == local_port {
-        tracing::info!("DIOCNATLOOK result matches listener address, ignoring");
-        return None;
-    }
-
-    Some(SocketAddr::V4(SocketAddrV4::new(rd_ip, rd_port)))
-}
-
-/// Fallback: look up original destination by parsing `pfctl -s state` output.
-///
-/// Two strategies:
-/// 1. Match peer_addr directly in state table
-/// 2. Match source port against outbound state entries (route-to creates outbound state)
-fn lookup_original_dst_pfctl(peer_addr: &SocketAddr, listener_port: u16) -> Option<SocketAddr> {
-    let output = std::process::Command::new("pfctl")
-        .args(["-s", "state"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::info!(stderr = %stderr, "pfctl -s state failed (may need root)");
-        return None;
-    }
-
-    let state_text = String::from_utf8_lossy(&output.stdout);
-    tracing::info!(lines = state_text.lines().count(), "pfctl -s state output");
-
-    // Strategy 1: direct match on peer address
-    if let Some(dst) = parse_pf_state_direct(&state_text, peer_addr) {
-        tracing::info!(dst = %dst, "pfctl fallback: found via direct match");
-        return Some(dst);
-    }
-
-    // Strategy 2: match source port in outbound state entries
-    let src_port = peer_addr.port();
-    if let Some(dst) = parse_pf_state_by_port(&state_text, src_port, listener_port) {
-        tracing::info!(dst = %dst, src_port = src_port, "pfctl fallback: found via source port match");
-        return Some(dst);
-    }
-
-    tracing::info!(peer = %peer_addr, "pfctl fallback: no match found in state table");
-    None
-}
-
-/// Strategy 1: find the peer address directly in the state table and extract the destination.
-fn parse_pf_state_direct(state_text: &str, peer_addr: &SocketAddr) -> Option<SocketAddr> {
-    let peer_str = peer_addr.to_string();
-
-    for line in state_text.lines() {
-        if !line.contains("tcp") {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
-        }
-
-        // Find source address match
-        let src_idx = match parts.iter().position(|&p| p == peer_str || p.starts_with(&peer_str)) {
-            Some(i) => i,
-            None => continue,
-        };
-
-        // Find the arrow (-> or <-)
-        let arrow_idx = match parts[src_idx..].iter().position(|&p| p == "->") {
-            Some(i) => i,
-            None => continue,
-        };
-        let dst_idx = src_idx + arrow_idx + 1;
-
-        if dst_idx < parts.len() {
-            if let Some(addr) = parse_addr_str(parts[dst_idx]) {
-                return Some(addr);
-            }
-        }
-    }
-
-    None
-}
-
-/// Strategy 2: find outbound state entry matching the source port.
-/// The `pass out route-to lo0 keep state` rule creates outbound state with the original
-/// destination. We match on source port to find it.
-fn parse_pf_state_by_port(state_text: &str, src_port: u16, listener_port: u16) -> Option<SocketAddr> {
-    let port_suffix = format!(":{}", src_port);
-
-    for line in state_text.lines() {
-        if !line.contains("tcp") {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
-        }
-
-        // Look for a source address ending with our port
-        for (i, &part) in parts.iter().enumerate() {
-            if !part.ends_with(&port_suffix) {
-                continue;
-            }
-            // Check for "->" arrow after this part
-            if i + 2 < parts.len() && parts[i + 1] == "->" {
-                let dst_str = parts[i + 2];
-                if let Some(addr) = parse_addr_str(dst_str) {
-                    // Skip if destination is our listener (this is the rdr state, not outbound)
-                    if addr.port() == listener_port && addr.ip().is_loopback() {
-                        continue;
-                    }
-                    return Some(addr);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Parse an address string like "1.2.3.4:443" from pfctl state output.
-fn parse_addr_str(s: &str) -> Option<SocketAddr> {
-    let clean = s.trim_end_matches(|c: char| !c.is_ascii_digit());
-    if let Ok(addr) = clean.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    if let Some((ip_str, port_str)) = clean.rsplit_once(':') {
-        if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
-            return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-        }
-    }
-    None
 }
