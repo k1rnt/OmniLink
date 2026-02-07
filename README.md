@@ -64,7 +64,13 @@ OS-level traffic interception. All TCP traffic is automatically redirected — n
 1. Start Transparent Proxy (pf) in Settings
 2. Administrator password required for pf rule installation
 
-Note: SOCKS Service is **not needed** for this mode. Running both SOCKS + pf simultaneously may cause routing loops.
+Note: SOCKS Service is **not needed** for this mode. The app prevents running both SOCKS + pf simultaneously.
+
+**Troubleshooting:** If pf interceptor crashes or the app exits abnormally, pf rules may remain active and block internet access. To restore connectivity, run:
+
+```sh
+sudo pfctl -a com.omnilink -F all && sudo pfctl -f /etc/pf.conf && sudo chmod 600 /dev/pf
+```
 
 ## Architecture
 
