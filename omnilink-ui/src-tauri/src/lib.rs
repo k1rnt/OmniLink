@@ -1173,7 +1173,14 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(Ok(info)) => info,
+        Ok(Ok(info)) => {
+            if let Some(ref p) = info {
+                tracing::debug!(pid = p.pid, name = %p.name, peer = %peer_addr, "process lookup succeeded");
+            } else {
+                tracing::debug!(peer = %peer_addr, "process lookup returned None");
+            }
+            info
+        }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "process lookup task failed");
             None
@@ -1249,7 +1256,12 @@ async fn handle_connection(
                                 tokio::io::copy(&mut ri, &mut wo),
                                 tokio::io::copy(&mut ro, &mut wi),
                             )
-                        } => { let _ = result; }
+                        } => {
+                            if let Ok((sent, received)) = result {
+                                session_manager.update_bytes(session_id, sent, received);
+                                traffic_stats.record_bytes(sent, received, proxy_name.as_deref(), dest_domain.as_deref());
+                            }
+                        }
                         _ = cancel_token.cancelled() => {
                             tracing::info!(session_id, "connection terminated by user");
                         }
@@ -1290,7 +1302,12 @@ async fn handle_connection(
                                 tokio::io::copy(&mut ri, &mut wo),
                                 tokio::io::copy(&mut ro, &mut wi),
                             )
-                        } => { let _ = result; }
+                        } => {
+                            if let Ok((sent, received)) = result {
+                                session_manager.update_bytes(session_id, sent, received);
+                                traffic_stats.record_bytes(sent, received, proxy_name.as_deref(), dest_domain.as_deref());
+                            }
+                        }
                         _ = cancel_token.cancelled() => {
                             tracing::info!(session_id, "connection terminated by user");
                         }
