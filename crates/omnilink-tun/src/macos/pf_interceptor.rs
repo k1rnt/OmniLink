@@ -294,18 +294,24 @@ fn install_pf_rules(
 
     tracing::info!(anchor = ANCHOR_NAME, "pf anchor rules and references installed");
 
-    // Verify rules are actually loaded in the anchor
+    // Verify rules are actually loaded in the anchor.
+    // Note: pfctl requires root to read anchor rules, so only error if the
+    // command succeeds (exit 0) but returns empty output.
     if let Ok(verify_out) = std::process::Command::new("pfctl")
         .args(["-a", ANCHOR_NAME, "-sr"])
         .output()
     {
-        let loaded_rules = String::from_utf8_lossy(&verify_out.stdout);
-        if loaded_rules.trim().is_empty() {
-            return Err(InterceptorError::RoutingSetup(
-                "pf anchor rules are empty after installation".to_string(),
-            ));
+        if verify_out.status.success() {
+            let loaded_rules = String::from_utf8_lossy(&verify_out.stdout);
+            if loaded_rules.trim().is_empty() {
+                return Err(InterceptorError::RoutingSetup(
+                    "pf anchor rules are empty after installation".to_string(),
+                ));
+            }
+            tracing::info!(rules = %loaded_rules.trim(), "pf anchor rules verified");
+        } else {
+            tracing::info!("pf anchor rules installed (verification skipped — needs root)");
         }
-        tracing::info!(rules = %loaded_rules.trim(), "pf anchor rules verified");
     }
 
     Ok(())
