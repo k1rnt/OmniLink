@@ -21,6 +21,7 @@ serde_yaml = "0.9"
 tokio-util = "0.7"
 omnilink-core = { path = "../../crates/omnilink-core" }
 omnilink-tun = { path = "../../crates/omnilink-tun" }
+dirs = "6"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"

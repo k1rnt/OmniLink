@@ -346,14 +346,25 @@ async fn run_pf_accept_loop(
                     Err(_) => continue,
                 };
 
-                // Look up original destination via DIOCNATLOOK
+                tracing::info!(
+                    peer = %peer_addr,
+                    local = %local_addr,
+                    "pf: accepted connection, looking up original destination"
+                );
+
+                // Try DIOCNATLOOK with both directions (PF_IN for rdr, PF_OUT for nat)
                 let original_dst =
-                    lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr)
-                        .or_else(|| lookup_original_dst_pfctl(&peer_addr));
+                    lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr, pf_sys::PF_IN)
+                        .or_else(|| lookup_original_dst_ioctl(pf_fd, &peer_addr, &local_addr, pf_sys::PF_OUT))
+                        .or_else(|| {
+                            tracing::info!("DIOCNATLOOK failed both directions, trying pfctl -s state");
+                            lookup_original_dst_pfctl(&peer_addr, local_addr.port())
+                        });
 
                 let Some(original_dst) = original_dst else {
                     tracing::warn!(
                         peer = %peer_addr,
+                        local = %local_addr,
                         "could not determine original destination, dropping connection"
                     );
                     continue;
@@ -403,6 +414,7 @@ fn lookup_original_dst_ioctl(
     pf_fd: RawFd,
     peer_addr: &SocketAddr,
     local_addr: &SocketAddr,
+    direction: u8,
 ) -> Option<SocketAddr> {
     let (peer_v4, peer_port) = match peer_addr {
         SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
@@ -416,7 +428,7 @@ fn lookup_original_dst_ioctl(
     let mut pnl = pf_sys::PfiocNatlook::default();
     pnl.af = pf_sys::AF_INET;
     pnl.proto = pf_sys::IPPROTO_TCP;
-    pnl.direction = pf_sys::PF_IN;
+    pnl.direction = direction;
 
     // Source: the application's address
     pnl.saddr.v4 = u32::from(peer_v4).to_be();
@@ -426,10 +438,18 @@ fn lookup_original_dst_ioctl(
     pnl.daddr.v4 = u32::from(local_v4).to_be();
     pnl.dxport.port = local_port.to_be();
 
+    let dir_name = if direction == pf_sys::PF_IN { "PF_IN" } else { "PF_OUT" };
+
     let ret = unsafe { libc::ioctl(pf_fd, pf_sys::diocnatlook_ioctl(), &mut pnl) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
-        tracing::debug!(error = %err, "DIOCNATLOOK failed");
+        tracing::info!(
+            dir = dir_name,
+            peer = %peer_addr,
+            local = %local_addr,
+            error = %err,
+            "DIOCNATLOOK failed"
+        );
         return None;
     }
 
@@ -437,8 +457,16 @@ fn lookup_original_dst_ioctl(
     let rd_ip = Ipv4Addr::from(u32::from_be(unsafe { pnl.rdaddr.v4 }));
     let rd_port = u16::from_be(unsafe { pnl.rdxport.port });
 
+    tracing::info!(
+        dir = dir_name,
+        result_ip = %rd_ip,
+        result_port = rd_port,
+        "DIOCNATLOOK succeeded"
+    );
+
     // Sanity check: result should differ from listener address
     if rd_ip == local_v4 && rd_port == local_port {
+        tracing::info!("DIOCNATLOOK result matches listener address, ignoring");
         return None;
     }
 
@@ -447,64 +475,126 @@ fn lookup_original_dst_ioctl(
 
 /// Fallback: look up original destination by parsing `pfctl -s state` output.
 ///
-/// Note: Does NOT use admin privilege escalation — that would trigger a password
-/// dialog for every connection. If pfctl fails without root, returns None.
-fn lookup_original_dst_pfctl(peer_addr: &SocketAddr) -> Option<SocketAddr> {
+/// Two strategies:
+/// 1. Match peer_addr directly in state table
+/// 2. Match source port against outbound state entries (route-to creates outbound state)
+fn lookup_original_dst_pfctl(peer_addr: &SocketAddr, listener_port: u16) -> Option<SocketAddr> {
     let output = std::process::Command::new("pfctl")
         .args(["-s", "state"])
         .output()
         .ok()?;
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::info!(stderr = %stderr, "pfctl -s state failed (may need root)");
         return None;
     }
 
     let state_text = String::from_utf8_lossy(&output.stdout);
-    parse_pf_state(&state_text, peer_addr)
+    tracing::info!(lines = state_text.lines().count(), "pfctl -s state output");
+
+    // Strategy 1: direct match on peer address
+    if let Some(dst) = parse_pf_state_direct(&state_text, peer_addr) {
+        tracing::info!(dst = %dst, "pfctl fallback: found via direct match");
+        return Some(dst);
+    }
+
+    // Strategy 2: match source port in outbound state entries
+    let src_port = peer_addr.port();
+    if let Some(dst) = parse_pf_state_by_port(&state_text, src_port, listener_port) {
+        tracing::info!(dst = %dst, src_port = src_port, "pfctl fallback: found via source port match");
+        return Some(dst);
+    }
+
+    tracing::info!(peer = %peer_addr, "pfctl fallback: no match found in state table");
+    None
 }
 
-/// Parse pfctl state table output to find the original destination for a connection.
-///
-/// State lines look like:
-/// `ALL tcp 192.168.1.100:54321 -> 93.184.216.34:443       ESTABLISHED:ESTABLISHED`
-/// After rdr, the destination in the state entry is the *original* destination.
-fn parse_pf_state(state_text: &str, peer_addr: &SocketAddr) -> Option<SocketAddr> {
+/// Strategy 1: find the peer address directly in the state table and extract the destination.
+fn parse_pf_state_direct(state_text: &str, peer_addr: &SocketAddr) -> Option<SocketAddr> {
     let peer_str = peer_addr.to_string();
 
     for line in state_text.lines() {
-        // Look for TCP state entries containing our peer address
         if !line.contains("tcp") {
             continue;
         }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
-        // Format: ALL tcp <src> -> <dst> <state>
-        // or: ALL tcp <src> (<rdr_dst>) -> <orig_dst> <state>
         if parts.len() < 5 {
             continue;
         }
 
         // Find source address match
-        let src_idx = parts.iter().position(|&p| p == peer_str || p.starts_with(&peer_str))?;
+        let src_idx = match parts.iter().position(|&p| p == peer_str || p.starts_with(&peer_str)) {
+            Some(i) => i,
+            None => continue,
+        };
 
-        // Find the arrow
-        let arrow_idx = parts[src_idx..].iter().position(|&p| p == "->")?;
+        // Find the arrow (-> or <-)
+        let arrow_idx = match parts[src_idx..].iter().position(|&p| p == "->") {
+            Some(i) => i,
+            None => continue,
+        };
         let dst_idx = src_idx + arrow_idx + 1;
 
         if dst_idx < parts.len() {
-            let dst_str = parts[dst_idx].trim_end_matches(|c: char| !c.is_ascii_digit());
-            if let Ok(addr) = dst_str.parse::<SocketAddr>() {
+            if let Some(addr) = parse_addr_str(parts[dst_idx]) {
                 return Some(addr);
             }
-            // Try IP:port format parsing
-            if let Some((ip_str, port_str)) = dst_str.rsplit_once(':') {
-                if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>())
-                {
-                    return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        }
+    }
+
+    None
+}
+
+/// Strategy 2: find outbound state entry matching the source port.
+/// The `pass out route-to lo0 keep state` rule creates outbound state with the original
+/// destination. We match on source port to find it.
+fn parse_pf_state_by_port(state_text: &str, src_port: u16, listener_port: u16) -> Option<SocketAddr> {
+    let port_suffix = format!(":{}", src_port);
+
+    for line in state_text.lines() {
+        if !line.contains("tcp") {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+
+        // Look for a source address ending with our port
+        for (i, &part) in parts.iter().enumerate() {
+            if !part.ends_with(&port_suffix) {
+                continue;
+            }
+            // Check for "->" arrow after this part
+            if i + 2 < parts.len() && parts[i + 1] == "->" {
+                let dst_str = parts[i + 2];
+                if let Some(addr) = parse_addr_str(dst_str) {
+                    // Skip if destination is our listener (this is the rdr state, not outbound)
+                    if addr.port() == listener_port && addr.ip().is_loopback() {
+                        continue;
+                    }
+                    return Some(addr);
                 }
             }
         }
     }
 
+    None
+}
+
+/// Parse an address string like "1.2.3.4:443" from pfctl state output.
+fn parse_addr_str(s: &str) -> Option<SocketAddr> {
+    let clean = s.trim_end_matches(|c: char| !c.is_ascii_digit());
+    if let Ok(addr) = clean.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Some((ip_str, port_str)) = clean.rsplit_once(':') {
+        if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
+            return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        }
+    }
     None
 }

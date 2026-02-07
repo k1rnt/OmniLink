@@ -1942,6 +1942,31 @@ pub fn run() {
             .plugin(tauri_plugin_process::init());
     }
 
+    // Set up file logging so pf diagnostics are visible
+    {
+        use tracing_subscriber::prelude::*;
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("com.omnilink.app")
+            .join("logs");
+        std::fs::create_dir_all(&log_dir).ok();
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("omnilink.log"))
+            .expect("failed to open log file");
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false);
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .init();
+        tracing::info!("OmniLink logging initialized to {}", log_dir.display());
+    }
+
     builder
         .manage(Mutex::new(initial_state))
         .invoke_handler(tauri::generate_handler![
