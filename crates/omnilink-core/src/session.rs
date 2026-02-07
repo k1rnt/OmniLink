@@ -105,6 +105,14 @@ impl SessionManager {
         }
     }
 
+    /// Set absolute byte counts for a session (used for final totals after relay).
+    pub fn set_bytes(&self, id: u64, sent: u64, received: u64) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(&id) {
+            session.bytes_sent = sent;
+            session.bytes_received = received;
+        }
+    }
+
     pub fn get_sessions(&self) -> Vec<Session> {
         let mut sessions = self.sessions.lock().unwrap();
 
