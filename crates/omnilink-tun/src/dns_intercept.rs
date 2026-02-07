@@ -143,6 +143,142 @@ fn encode_domain_name(buf: &mut Vec<u8>, domain: &str) {
     buf.push(0); // root label
 }
 
+/// A parsed DNS response with answer records.
+#[derive(Debug)]
+pub struct DnsAnswer {
+    pub domain: String,
+    pub records: Vec<DnsRecord>,
+}
+
+/// A single DNS resource record.
+#[derive(Debug)]
+pub enum DnsRecord {
+    A(std::net::Ipv4Addr),
+    Aaaa(std::net::Ipv6Addr),
+}
+
+/// Parse a DNS response payload and extract A/AAAA answer records.
+pub fn parse_dns_response(data: &[u8]) -> Option<DnsAnswer> {
+    if data.len() < 12 {
+        return None;
+    }
+
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    // Must be a response (QR=1)
+    if flags & 0x8000 == 0 {
+        return None;
+    }
+
+    let qdcount = u16::from_be_bytes([data[4], data[5]]);
+    let ancount = u16::from_be_bytes([data[6], data[7]]);
+
+    if qdcount == 0 || ancount == 0 {
+        return None;
+    }
+
+    // Parse question section to get the domain name
+    let mut offset = 12;
+    let domain = parse_domain_name(data, &mut offset)?;
+
+    // Skip QTYPE and QCLASS (4 bytes)
+    offset += 4;
+    if offset > data.len() {
+        return None;
+    }
+
+    // Parse answer records
+    let mut records = Vec::new();
+    for _ in 0..ancount {
+        if offset >= data.len() {
+            break;
+        }
+
+        // Parse name (may be a compression pointer)
+        let _name = parse_domain_name(data, &mut offset)?;
+
+        if offset + 10 > data.len() {
+            break;
+        }
+
+        let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
+        offset += 10;
+
+        if offset + rdlength > data.len() {
+            break;
+        }
+
+        match rtype {
+            TYPE_A if rdlength == 4 => {
+                let ip = std::net::Ipv4Addr::new(
+                    data[offset], data[offset + 1],
+                    data[offset + 2], data[offset + 3],
+                );
+                records.push(DnsRecord::A(ip));
+            }
+            TYPE_AAAA if rdlength == 16 => {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&data[offset..offset + 16]);
+                records.push(DnsRecord::Aaaa(std::net::Ipv6Addr::from(bytes)));
+            }
+            _ => {}
+        }
+
+        offset += rdlength;
+    }
+
+    Some(DnsAnswer { domain, records })
+}
+
+/// Parse a DNS domain name at the given offset, handling compression pointers.
+fn parse_domain_name(data: &[u8], offset: &mut usize) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut pos = *offset;
+    let mut jumped = false;
+    let mut jump_count = 0;
+
+    loop {
+        if pos >= data.len() {
+            return None;
+        }
+
+        let len = data[pos] as usize;
+
+        if len == 0 {
+            if !jumped {
+                *offset = pos + 1;
+            }
+            break;
+        }
+
+        // Compression pointer (top 2 bits set)
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= data.len() {
+                return None;
+            }
+            if !jumped {
+                *offset = pos + 2;
+            }
+            pos = ((len & 0x3F) << 8) | (data[pos + 1] as usize);
+            jumped = true;
+            jump_count += 1;
+            if jump_count > 10 {
+                return None;
+            }
+            continue;
+        }
+
+        pos += 1;
+        if pos + len > data.len() {
+            return None;
+        }
+        labels.push(std::str::from_utf8(&data[pos..pos + len]).ok()?.to_string());
+        pos += len;
+    }
+
+    Some(labels.join("."))
+}
+
 /// Check if a UDP packet is destined for DNS (port 53).
 pub fn is_dns_packet(dst_port: u16) -> bool {
     dst_port == 53

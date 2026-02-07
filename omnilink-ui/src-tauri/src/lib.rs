@@ -1610,7 +1610,7 @@ async fn start_pf_interceptor(state: State<'_, SharedState>) -> Result<String, S
     let virtual_dns = state_guard.virtual_dns.clone();
     let session_manager = state_guard.session_manager.clone();
     let traffic_stats = state_guard.traffic_stats.clone();
-    let mut interceptor = omnilink_tun::create_pf_interceptor(excluded_ips);
+    let mut interceptor = omnilink_tun::create_pf_interceptor(excluded_ips, virtual_dns.clone());
 
     let mut event_rx = interceptor
         .start()
@@ -1636,7 +1636,7 @@ async fn start_pf_interceptor(state: State<'_, SharedState>) -> Result<String, S
 
                         let dst_ip = conn.original_dst.ip();
                         let dst_port = conn.original_dst.port();
-                        let domain = virtual_dns.lookup(dst_ip);
+                        let domain = virtual_dns.lookup_real_ip(dst_ip);
 
                         let dest = if let Some(ref d) = domain {
                             ProxyDestination::Domain(d.clone(), dst_port)

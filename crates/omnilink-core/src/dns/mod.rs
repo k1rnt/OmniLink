@@ -30,6 +30,8 @@ pub struct VirtualDns {
     pool_start: u32,
     /// End of the fake IP pool (198.19.255.255).
     pool_end: u32,
+    /// Maps real IP -> domain (populated by DNS response recording for pf mode).
+    real_ip_to_domain: Mutex<HashMap<IpAddr, String>>,
 }
 
 impl VirtualDns {
@@ -43,6 +45,7 @@ impl VirtualDns {
             next_ip: Mutex::new(pool_start),
             pool_start,
             pool_end,
+            real_ip_to_domain: Mutex::new(HashMap::new()),
         }
     }
 
@@ -97,6 +100,24 @@ impl VirtualDns {
     /// Get the number of allocated fake IPs.
     pub fn allocated_count(&self) -> usize {
         self.domain_to_ip.lock().unwrap().len()
+    }
+
+    /// Record a real IP -> domain mapping from an observed DNS response.
+    pub fn record_dns_mapping(&self, ip: IpAddr, domain: &str) {
+        let mut map = self.real_ip_to_domain.lock().unwrap();
+        map.insert(ip, domain.to_lowercase());
+    }
+
+    /// Look up a domain for an IP, checking the real-IP reverse table first,
+    /// then falling back to the FakeIP table.
+    pub fn lookup_real_ip(&self, ip: IpAddr) -> Option<String> {
+        {
+            let map = self.real_ip_to_domain.lock().unwrap();
+            if let Some(domain) = map.get(&ip) {
+                return Some(domain.clone());
+            }
+        }
+        self.lookup(ip)
     }
 }
 

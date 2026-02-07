@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicehash/tauri/refs/heads/dev/crates/tauri-config-schema/schema.json",
   "productName": "OmniLink",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "identifier": "com.omnilink.app",
   "build": {
     "frontendDist": "../dist",

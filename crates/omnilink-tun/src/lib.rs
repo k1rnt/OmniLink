@@ -57,8 +57,9 @@ pub fn create_ne_interceptor(
 #[cfg(target_os = "macos")]
 pub fn create_pf_interceptor(
     excluded_ips: Vec<std::net::Ipv4Addr>,
+    virtual_dns: std::sync::Arc<omnilink_core::dns::VirtualDns>,
 ) -> Box<dyn interceptor::Interceptor> {
-    Box::new(macos::pf_interceptor::PfInterceptor::new(excluded_ips))
+    Box::new(macos::pf_interceptor::PfInterceptor::new(excluded_ips, virtual_dns))
 }
 
 /// Run the privileged pf helper (DIOCNATLOOK server).

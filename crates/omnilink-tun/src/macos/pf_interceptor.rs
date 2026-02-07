@@ -4,12 +4,15 @@
 //! queries the original destination via DIOCNATLOOK ioctl on /dev/pf.
 //! Requires administrator privileges for pfctl and /dev/pf access.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
+
+use omnilink_core::dns::VirtualDns;
 
 use crate::interceptor::{InterceptedConnection, Interceptor, InterceptorError, InterceptorEvent};
 
@@ -57,16 +60,25 @@ pub struct PfInterceptor {
     abort_handle: Option<tokio::task::JoinHandle<()>>,
     /// The listener port allocated during start.
     listener_port: u16,
+    /// Port for the DNS UDP listener.
+    dns_listener_port: u16,
+    /// Handle for the spawned DNS listener task.
+    dns_abort_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Virtual DNS for recording real IP -> domain mappings.
+    virtual_dns: Option<Arc<VirtualDns>>,
 }
 
 impl PfInterceptor {
-    pub fn new(excluded_ips: Vec<Ipv4Addr>) -> Self {
+    pub fn new(excluded_ips: Vec<Ipv4Addr>, virtual_dns: Arc<VirtualDns>) -> Self {
         Self {
             running: false,
             excluded_ips,
             interface: None,
             abort_handle: None,
             listener_port: 0,
+            dns_listener_port: 0,
+            dns_abort_handle: None,
+            virtual_dns: Some(virtual_dns),
         }
     }
 }
@@ -97,8 +109,24 @@ impl Interceptor for PfInterceptor {
         self.listener_port = local_addr.port();
         tracing::info!(port = self.listener_port, "pf TCP listener bound");
 
+        // 2b. Bind UDP socket for DNS interception
+        let dns_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .map_err(InterceptorError::Io)?;
+        let dns_addr = dns_socket.local_addr().map_err(InterceptorError::Io)?;
+        self.dns_listener_port = dns_addr.port();
+        tracing::info!(port = self.dns_listener_port, "pf DNS listener bound");
+
+        // 2c. Detect upstream DNS server
+        let upstream_dns_servers = detect_upstream_dns();
+        let upstream_dns = SocketAddr::new(
+            std::net::IpAddr::V4(upstream_dns_servers[0]),
+            53,
+        );
+        tracing::info!(upstream = %upstream_dns, "detected upstream DNS server");
+
         // 3. Install pf anchor rules and launch privileged DIOCNATLOOK helper
-        install_pf_rules(&iface, self.listener_port, &self.excluded_ips)?;
+        install_pf_rules(&iface, self.listener_port, self.dns_listener_port, &self.excluded_ips)?;
 
         // 4. Spawn accept loop (queries helper via Unix socket for original dst)
         let (tx, rx) = mpsc::channel(256);
@@ -108,6 +136,15 @@ impl Interceptor for PfInterceptor {
         });
 
         self.abort_handle = Some(handle);
+
+        // 4b. Spawn DNS listener
+        let dns_socket = Arc::new(dns_socket);
+        let virtual_dns = self.virtual_dns.clone().unwrap();
+        let dns_handle = tokio::spawn(async move {
+            run_dns_listener(dns_socket, upstream_dns, virtual_dns).await;
+        });
+        self.dns_abort_handle = Some(dns_handle);
+
         self.running = true;
 
         Ok(rx)
@@ -116,6 +153,11 @@ impl Interceptor for PfInterceptor {
     async fn stop(&mut self) -> Result<(), InterceptorError> {
         // 1. Abort the accept task
         if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
+        }
+
+        // 1b. Abort the DNS listener task
+        if let Some(handle) = self.dns_abort_handle.take() {
             handle.abort();
         }
 
@@ -155,6 +197,7 @@ fn detect_active_interface() -> Option<String> {
 fn install_pf_rules(
     iface: &str,
     listener_port: u16,
+    dns_listener_port: u16,
     excluded_ips: &[Ipv4Addr],
 ) -> Result<(), InterceptorError> {
     let mut rules = String::new();
@@ -165,6 +208,10 @@ fn install_pf_rules(
     rules.push_str(&format!(
         "rdr pass on lo0 proto tcp from any to !127.0.0.0/8 -> 127.0.0.1 port {}\n",
         listener_port
+    ));
+    rules.push_str(&format!(
+        "rdr pass on lo0 proto udp from any to !127.0.0.0/8 port 53 -> 127.0.0.1 port {}\n",
+        dns_listener_port
     ));
 
     // --- Filter rules (pass) ---
@@ -185,8 +232,20 @@ fn install_pf_rules(
         iface, BYPASS_PORT_START, BYPASS_PORT_END
     ));
 
+    // Allow UDP bypass port range to pass without re-interception
+    rules.push_str(&format!(
+        "pass out quick on {} proto udp from any port {}:{} no state\n",
+        iface, BYPASS_PORT_START, BYPASS_PORT_END
+    ));
+
     rules.push_str(&format!(
         "pass out on {} route-to lo0 inet proto tcp from any to any keep state\n",
+        iface
+    ));
+
+    // Route outbound DNS (UDP port 53) to loopback for interception
+    rules.push_str(&format!(
+        "pass out on {} route-to lo0 inet proto udp from any to any port 53 keep state\n",
         iface
     ));
 
@@ -271,6 +330,178 @@ fn flush_pf_rules() {
     match privilege::run_with_admin_privileges(&cmd) {
         Ok(_) => tracing::info!(anchor = ANCHOR_NAME, "pf rules flushed and helper stopped"),
         Err(e) => tracing::warn!(error = %e, "failed to flush pf rules (may need manual cleanup)"),
+    }
+}
+
+/// Detect upstream DNS servers by parsing `scutil --dns` output.
+///
+/// Looks for nameserver entries under resolver #1. Falls back to 8.8.8.8 if
+/// none are found or the command fails.
+fn detect_upstream_dns() -> Vec<Ipv4Addr> {
+    let output = match std::process::Command::new("scutil")
+        .arg("--dns")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to run scutil --dns, using 8.8.8.8");
+            return vec![Ipv4Addr::new(8, 8, 8, 8)];
+        }
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut servers = Vec::new();
+    let mut in_resolver_1 = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("resolver #1") {
+            in_resolver_1 = true;
+            continue;
+        }
+        if in_resolver_1 && trimmed.starts_with("resolver #") {
+            // We've moved past resolver #1
+            break;
+        }
+        if in_resolver_1 && trimmed.starts_with("nameserver[") {
+            // Format: "nameserver[0] : 192.168.1.1"
+            if let Some(addr_str) = trimmed.split(':').nth(1) {
+                if let Ok(ip) = addr_str.trim().parse::<Ipv4Addr>() {
+                    servers.push(ip);
+                }
+            }
+        }
+    }
+
+    if servers.is_empty() {
+        tracing::warn!("no nameservers found in scutil --dns resolver #1, using 8.8.8.8");
+        servers.push(Ipv4Addr::new(8, 8, 8, 8));
+    }
+
+    tracing::info!(servers = ?servers, "detected upstream DNS servers");
+    servers
+}
+
+/// Create a UDP socket bound to a bypass source port.
+///
+/// Tries up to 10 ports from the bypass range to find one that is available.
+fn create_bypass_udp_socket() -> std::io::Result<std::net::UdpSocket> {
+    for _ in 0..10 {
+        let port = next_bypass_port();
+        let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
+        match std::net::UdpSocket::bind(addr) {
+            Ok(sock) => {
+                sock.set_nonblocking(true)?;
+                return Ok(sock);
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "failed to bind bypass UDP socket after 10 attempts",
+    ))
+}
+
+/// DNS listener loop: receives redirected DNS queries and forwards them
+/// to the upstream DNS server, recording A/AAAA mappings in VirtualDns.
+async fn run_dns_listener(
+    dns_socket: Arc<UdpSocket>,
+    upstream_dns: SocketAddr,
+    virtual_dns: Arc<VirtualDns>,
+) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let (len, src) = match dns_socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "DNS listener recv_from error");
+                continue;
+            }
+        };
+
+        let query_data = buf[..len].to_vec();
+        let dns_socket = dns_socket.clone();
+        let virtual_dns = virtual_dns.clone();
+
+        tokio::spawn(async move {
+            // Create a bypass UDP socket so pf doesn't re-intercept
+            let bypass_sock = match create_bypass_udp_socket() {
+                Ok(std_sock) => match UdpSocket::from_std(std_sock) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to convert bypass UDP socket to tokio");
+                        return;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create bypass UDP socket");
+                    return;
+                }
+            };
+
+            // Forward the query to upstream DNS
+            if let Err(e) = bypass_sock.send_to(&query_data, upstream_dns).await {
+                tracing::error!(error = %e, upstream = %upstream_dns, "failed to forward DNS query");
+                return;
+            }
+
+            // Wait for response with 5s timeout
+            let mut resp_buf = [0u8; 4096];
+            let resp_len = match tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                bypass_sock.recv_from(&mut resp_buf),
+            )
+            .await
+            {
+                Ok(Ok((len, _))) => len,
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "DNS upstream recv error");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(upstream = %upstream_dns, "DNS upstream response timed out (5s)");
+                    return;
+                }
+            };
+
+            let response_data = &resp_buf[..resp_len];
+
+            // Parse the DNS response and record A/AAAA mappings
+            if let Some(answer) = crate::dns_intercept::parse_dns_response(response_data) {
+                for record in &answer.records {
+                    match record {
+                        crate::dns_intercept::DnsRecord::A(ip) => {
+                            virtual_dns.record_dns_mapping(
+                                std::net::IpAddr::V4(*ip),
+                                &answer.domain,
+                            );
+                            tracing::debug!(
+                                domain = %answer.domain,
+                                ip = %ip,
+                                "recorded DNS A mapping"
+                            );
+                        }
+                        crate::dns_intercept::DnsRecord::Aaaa(ip) => {
+                            virtual_dns.record_dns_mapping(
+                                std::net::IpAddr::V6(*ip),
+                                &answer.domain,
+                            );
+                            tracing::debug!(
+                                domain = %answer.domain,
+                                ip = %ip,
+                                "recorded DNS AAAA mapping"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Send the original response back to the client
+            if let Err(e) = dns_socket.send_to(response_data, src).await {
+                tracing::error!(error = %e, client = %src, "failed to send DNS response to client");
+            }
+        });
     }
 }
 
