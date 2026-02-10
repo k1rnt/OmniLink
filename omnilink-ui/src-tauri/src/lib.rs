@@ -1684,7 +1684,7 @@ async fn start_pf_interceptor(state: State<'_, SharedState>) -> Result<String, S
 
                         let dest_domain_clone = ctx.dest_domain.clone();
                         let result = handle_pf_connection(
-                            inbound, dest, &action, &chain_relay,
+                            inbound, conn.original_dst, dest, &action, &chain_relay,
                             &session_manager, &traffic_stats, session_id,
                             cancel_token, proxy_name, dest_domain_clone,
                         ).await;
@@ -1764,6 +1764,7 @@ async fn get_pf_interceptor_status(state: State<'_, SharedState>) -> Result<bool
 #[cfg(target_os = "macos")]
 async fn handle_pf_connection(
     inbound: tokio::net::TcpStream,
+    original_dst: std::net::SocketAddr,
     dest: omnilink_core::proxy::ProxyDestination,
     action: &Action,
     chain_relay: &Arc<ChainRelay>,
@@ -1784,28 +1785,9 @@ async fn handle_pf_connection(
         }
         Action::Direct => {
             session_manager.update_status(session_id, SessionStatus::Active);
-            let target: std::net::SocketAddr = match &dest {
-                omnilink_core::proxy::ProxyDestination::SocketAddr(a) => *a,
-                omnilink_core::proxy::ProxyDestination::Domain(d, p) => {
-                    // Resolve domain to IP for TcpSocket::connect
-                    match tokio::net::lookup_host(format!("{}:{}", d, p)).await {
-                        Ok(mut addrs) => match addrs.next() {
-                            Some(addr) => addr,
-                            None => {
-                                let msg = format!("DNS resolution failed for {}:{}", d, p);
-                                session_manager.update_status(session_id, SessionStatus::Error(msg.clone()));
-                                traffic_stats.record_connection_close();
-                                return Err(msg.into());
-                            }
-                        },
-                        Err(e) => {
-                            session_manager.update_status(session_id, SessionStatus::Error(e.to_string()));
-                            traffic_stats.record_connection_close();
-                            return Err(e.into());
-                        }
-                    }
-                }
-            };
+            // Use the original destination IP directly (from DIOCNATLOOK).
+            // No DNS re-resolution needed — avoids going through the pf DNS interceptor.
+            let target = original_dst;
             // Bind to a bypass source port so pf doesn't re-intercept this connection
             let bypass_port = omnilink_tun::macos::pf_interceptor::next_bypass_port();
             let socket = tokio::net::TcpSocket::new_v4()
