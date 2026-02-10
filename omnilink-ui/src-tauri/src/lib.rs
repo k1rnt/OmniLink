@@ -1891,6 +1891,13 @@ async fn export_rules_yaml(state: State<'_, SharedState>) -> Result<String, Stri
     serde_yaml::to_string(&export).map_err(|e| e.to_string())
 }
 
+/// Write arbitrary text content to a file path (used for CSV export, etc.).
+#[tauri::command]
+async fn write_text_file(path: String, content: String) -> Result<String, String> {
+    std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {}", e))?;
+    Ok(format!("Saved to {}", path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let initial_state = AppStateInner {
@@ -1994,6 +2001,7 @@ pub fn run() {
             get_pf_interceptor_status,
             list_installed_apps,
             export_rules_yaml,
+            write_text_file,
         ])
         .setup(|app| {
             use tauri::Manager;

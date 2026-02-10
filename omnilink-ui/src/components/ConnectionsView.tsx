@@ -1,9 +1,14 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useToast } from "../hooks/useToast";
 import type { Session } from "../types";
 
 type FilterMode = "all" | "active" | "closed";
+
+// Persist filter state across tab switches (component remounts)
+let persistedFilter: FilterMode = "all";
+let persistedSearch = "";
 
 const MAX_RENDERED_ROWS = 200;
 
@@ -25,6 +30,17 @@ function getActionBadge(action: string): string {
   return "";
 }
 
+function sessionsToCSV(sessions: Session[]): string {
+  const header = "ID,Status,Process,Destination,Action,Proxy,Sent(bytes),Received(bytes),Duration(ms)";
+  const rows = sessions.map((s) => {
+    const proxy = s.proxy_name ?? "";
+    const process = (s.process_name ?? "").replace(/,/g, " ");
+    const dest = s.destination.replace(/,/g, " ");
+    return `${s.id},${s.status},${process},${dest},${s.action},${proxy},${s.bytes_sent},${s.bytes_received},${s.elapsed_ms}`;
+  });
+  return [header, ...rows].join("\n");
+}
+
 function getStatusBadge(status: string): string {
   switch (status) {
     case "active": return "badge-active";
@@ -42,10 +58,19 @@ interface ContextMenuState {
 }
 
 function ConnectionsView() {
-  const { error: showError } = useToast();
+  const { error: showError, success: showSuccess } = useToast();
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [filter, setFilter] = useState<FilterMode>("all");
-  const [searchQuery, setSearchQuery] = useState("");
+  const [filter, setFilterState] = useState<FilterMode>(persistedFilter);
+  const [searchQuery, setSearchQueryState] = useState(persistedSearch);
+
+  const setFilter = useCallback((f: FilterMode) => {
+    persistedFilter = f;
+    setFilterState(f);
+  }, []);
+  const setSearchQuery = useCallback((q: string) => {
+    persistedSearch = q;
+    setSearchQueryState(q);
+  }, []);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     visible: false, x: 0, y: 0, session: null,
   });
@@ -146,6 +171,21 @@ function ConnectionsView() {
     }
   }, [fetchSessions]);
 
+  const handleExport = useCallback(async () => {
+    try {
+      const csv = sessionsToCSV(filteredSessions);
+      const filePath = await saveDialog({
+        defaultPath: "connections.csv",
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!filePath) return;
+      await invoke("write_text_file", { path: filePath, content: csv });
+      showSuccess(`Exported ${filteredSessions.length} connections`);
+    } catch (e) {
+      showError(`Export failed: ${e}`);
+    }
+  }, [filteredSessions]);
+
   const totalSent = useMemo(() => sessions.reduce((a, s) => a + s.bytes_sent, 0), [sessions]);
   const totalRecv = useMemo(() => sessions.reduce((a, s) => a + s.bytes_received, 0), [sessions]);
 
@@ -164,6 +204,9 @@ function ConnectionsView() {
           ))}
           <button className="btn" onClick={handleClearClosed} title="Remove all closed connections">
             Clear Closed
+          </button>
+          <button className="btn" onClick={handleExport} title="Export connections as CSV">
+            Export
           </button>
         </div>
         <input
